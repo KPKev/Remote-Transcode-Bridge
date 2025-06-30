@@ -1,0 +1,41 @@
+# =============================================================
+# Transcode Script Configuration Template (transcode.conf)
+# =============================================================
+# Copy this file to transcode.conf and edit with your settings.
+# Any variable defined here overrides the script's internal defaults.
+# =============================================================
+
+# ----------------- SSH / Remote GPU -----------------
+SSH_HOST="192.168.7.16"    # IP or hostname of Windows box running NVENC
+SSH_PORT="22"              # SSH port (22 by default)
+SSH_USER="your_username"   # SSH login user
+SSH_KEY="/config/.ssh/id_rsa"  # Private key path inside container
+
+# ----------------- Encoding Targets -----------------
+# Video quality caps for Plex Direct-Play
+BITRATE_TARGET="6M"        # Average bitrate target (VBR-HQ)
+BITRATE_MAX="8M"           # Peak maxrate (≤ 8 Mbit/s)
+BITRATE_BUFSIZE="16M"      # Rate-control buffer
+RESOLUTION_MAX="1920x1080" # Max output resolution (widthxheight)
+NVENC_PRESET="p4"          # Quality preset for h264_nvenc (p4 ≈ slow)
+
+# ----------------- Logging -----------------
+LOG_MAX_LINES="1000"       # Rotate log after this many lines
+LOG_KEEP="5"              # Keep this many rotated log files
+
+# ----------------- Sonarr / Radarr -----------------
+SONARR_URL="http://sonarr:8989"
+SONARR_API_KEY="your_sonarr_api_key_here"
+RADARR_URL="http://radarr:7878"
+RADARR_API_KEY="your_radarr_api_key_here"
+
+# ----------------- Plex Library Refresh -------------
+PLEX_URL="http://plex:32400"   # Base URL (no trailing slash)
+PLEX_TOKEN="your_plex_token_here"  # Plex auth token (leave blank to disable refresh)
+PLEX_SECTION_ID_TV="2"        # TV Shows library section key
+PLEX_SECTION_ID_MOVIES="1"    # Movies library section key
+
+# ----------------- Advanced -----------------
+# Leave blank to accept script defaults.
+# QUALITY="high|medium|low"   # (future use)
+FORCE_CPU="false"            # Set to "true" to force local CPU encoding 
