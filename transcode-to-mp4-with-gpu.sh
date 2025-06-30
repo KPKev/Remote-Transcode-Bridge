@@ -69,6 +69,8 @@ JOB_CATEGORY="$5"
 # Default log path: same directory as this script, unless overridden by transcode.conf
 SCRIPT_DIR="$(dirname "$0")"
 LOG_FILE="${LOG_FILE:-"${SCRIPT_DIR}/transcode_script.log"}"
+# Prefer local binaries placed next to this script (ffmpeg, ffprobe, curl, etc.)
+export PATH="${SCRIPT_DIR}:$PATH"
 mkdir -p "$(dirname "$LOG_FILE")"  # Ensure log directory exists
 NEEDS_TRANSCODE=0
 NEEDS_NOTIFICATION=0
