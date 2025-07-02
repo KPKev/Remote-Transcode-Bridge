@@ -56,7 +56,6 @@ PLEX_TOKEN="${PLEX_TOKEN:-}"
 PLEX_SECTION_ID="${PLEX_SECTION_ID:-}"
 PLEX_SECTION_ID_TV="${PLEX_SECTION_ID_TV:-}"
 PLEX_SECTION_ID_MOVIES="${PLEX_SECTION_ID_MOVIES:-}"
-FORCE_CPU="${FORCE_CPU:-false}"
 
 # ==============================================================================
 #                                SCRIPT LOGIC
@@ -159,20 +158,23 @@ if [[ "$NEEDS_TRANSCODE" -eq 1 ]]; then
     mkfifo "$PROGRESS_PIPE"
 
     # --------------------------------------------------------
-    # Decide encoding mode: GPU via SSH or local CPU fallback
+    # Verify remote GPU host is configured and reachable
     # --------------------------------------------------------
+    log "Verifying remote GPU host connectivity..."
 
-    ENCODE_MODE="GPU"
-    if [[ "${FORCE_CPU,,}" == "true" ]]; then
-        log "FORCE_CPU flag enabled – using local CPU encode for testing."
-        ENCODE_MODE="CPU"
-    elif [[ "$ENCODE_MODE" == "GPU" && -z "$SSH_HOST" ]]; then
-        log "SSH_HOST not set – defaulting to local CPU encode."
-        ENCODE_MODE="CPU"
-    elif [[ "$ENCODE_MODE" == "GPU" ]] && ! ssh -q -o BatchMode=yes -o ConnectTimeout=10 -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" "echo ok" 2>/dev/null; then
-        log "Remote GPU host unreachable – falling back to local CPU encode."
-        ENCODE_MODE="CPU"
+    if [[ -z "$SSH_HOST" || -z "$SSH_USER" ]]; then
+        log "Error: SSH_HOST or SSH_USER not defined in transcode.conf. Cannot proceed with GPU transcoding."
+        log "--- SCRIPT END (FAILURE) ---"
+        exit 1
     fi
+
+    if ! ssh -q -o BatchMode=yes -o ConnectTimeout=10 -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" "echo ok" 2>/dev/null; then
+        log "Error: Remote GPU host ($SSH_USER@$SSH_HOST) is unreachable. Check network, firewall, and SSH server status."
+        log "--- SCRIPT END (FAILURE) ---"
+        exit 1
+    fi
+
+    log "Remote GPU host is reachable."
 
     # --- Build Audio Command ---
     AUDIO_PARAMS=""
@@ -194,23 +196,14 @@ if [[ "$NEEDS_TRANSCODE" -eq 1 ]]; then
 
     FFMPEG_CMD_GPU="ffmpeg -hide_banner -v error -y -i - -map 0:v:0 -map 0:a:0 -c:v h264_nvenc -preset ${NVENC_PRESET} -profile:v high -level:v 4.0 -pix_fmt yuv420p -vf ${SCALE_FILTER} -rc:v vbr_hq -b:v ${BITRATE_TARGET} -maxrate:v ${BITRATE_MAX} -bufsize:v ${BITRATE_BUFSIZE} ${AUDIO_PARAMS} -movflags frag_keyframe+empty_moov -f mp4 - -progress pipe:2"
 
-    # Local CPU fallback command (x264 fast)
-    FFMPEG_CMD_CPU="ffmpeg -hide_banner -v error -y -i $(printf %q "$VIDEO_FILE") -map 0:v:0 -map 0:a:0 -c:v libx264 -preset fast -profile:v high -level:v 4.0 -pix_fmt yuv420p -vf ${SCALE_FILTER} -crf 20 -maxrate ${BITRATE_MAX} -bufsize ${BITRATE_BUFSIZE} ${AUDIO_PARAMS} -movflags +faststart -f mp4 $(printf %q "$TEMP_OUTPUT_FILE") -progress pipe:2"
-
     # --- Start FFMPEG pipeline in the background ---
-    log "Streaming to $SSH_HOST for transcoding..."
+    log "Streaming to $SSH_HOST for GPU transcoding..."
     log "Executing remote command over SSH: ${FFMPEG_CMD_GPU}"
     
-    if [[ "$ENCODE_MODE" == "GPU" ]]; then
-        # Remote GPU encode via SSH
-        ssh -q -T -o "ConnectTimeout=15" -o "StrictHostKeyChecking=no" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
-            "${FFMPEG_CMD_GPU}" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> "$PROGRESS_PIPE" &
-        FFMPEG_PID=$!
-    else
-        # Local CPU encode
-        bash -c "${FFMPEG_CMD_CPU}" 2> "$PROGRESS_PIPE" &
-        FFMPEG_PID=$!
-    fi
+    # Remote GPU encode via SSH
+    ssh -q -T -o "ConnectTimeout=15" -o "StrictHostKeyChecking=no" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
+        "${FFMPEG_CMD_GPU}" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> "$PROGRESS_PIPE" &
+    FFMPEG_PID=$!
 
     # --- Start Progress Reader in the background ---
     # This subshell reads from the named pipe and prints status for Sabnzbd UI
@@ -259,7 +252,7 @@ if [[ "$NEEDS_TRANSCODE" -eq 1 ]]; then
                 fi
 
                 if [[ "$PERCENTAGE" -gt "$LAST_PERCENTAGE" ]]; then
-                    echo "Transcoding(${ENCODE_MODE}) | ${PERCENTAGE}% | ETA: ${ETR_STR} | ${CURRENT_SPEED}x"
+                    echo "Transcoding(GPU) | ${PERCENTAGE}% | ETA: ${ETR_STR} | ${CURRENT_SPEED}x"
                     LAST_PERCENTAGE=$PERCENTAGE
                 fi
             fi
@@ -312,7 +305,7 @@ if [[ "$NEEDS_TRANSCODE" -eq 1 ]]; then
     }
 
     if [ $FFMPEG_EXIT_CODE -eq 0 ]; then
-        log "Transcoding (${ENCODE_MODE}) completed successfully to temporary file."
+        log "GPU transcoding completed successfully to temporary file."
         
         # Analyze the temporary file before proceeding.
         analyze_and_log "$TEMP_OUTPUT_FILE"

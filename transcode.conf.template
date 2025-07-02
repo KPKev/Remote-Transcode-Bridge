@@ -38,4 +38,7 @@ PLEX_SECTION_ID_MOVIES="1"    # Movies library section key
 # ----------------- Advanced -----------------
 # Leave blank to accept script defaults.
 # QUALITY="high|medium|low"   # (future use)
-FORCE_CPU="false"            # Set to "true" to force local CPU encoding 
+
+# ----------------- Advanced -----------------
+# Leave blank to accept script defaults.
+# QUALITY="high|medium|low"   # (future use) 

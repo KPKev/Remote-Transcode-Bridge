@@ -11,7 +11,6 @@ A robust post-processing script for Sabnzbd that automatically transcodes downlo
 - **Automatic Library Refresh**: Triggers Plex library updates after processing
 - **Sonarr/Radarr Integration**: Automatic notifications to media managers
 - **Configurable Quality Settings**: Adjustable bitrates, resolution, and encoding presets
-- **CPU Fallback**: Automatic fallback to local CPU encoding if GPU unavailable
 - **Comprehensive Logging**: Detailed logging with rotation and archiving
 
 ## 📋 Requirements
@@ -95,11 +94,11 @@ transcode-to-mp4-script/
 ### 2. Transcoding Decision
 **Files are transcoded if they are NOT:**
 - MP4 container format
-- H.264 video codec
 - AAC audio codec
 - 2-channel stereo audio
 
 ### 3. GPU Processing
+- **Connection Check**: Verifies SSH connectivity to the remote host before starting.
 - Streams video file to remote GPU machine via SSH
 - Uses NVIDIA NVENC encoder for hardware acceleration
 - Applies quality settings for Plex Direct-Play compatibility
@@ -151,12 +150,6 @@ transcode-to-mp4-script/
 
 ## 🔧 Advanced Configuration
 
-### Force CPU Encoding
-Set in `transcode.conf`:
-```bash
-FORCE_CPU="true"
-```
-
 ### Custom Quality Presets
 Available NVENC presets:
 - `p1` - Fastest (lower quality)
@@ -166,12 +159,6 @@ Available NVENC presets:
 - `p5` - Slow
 - `p6` - Slower
 - `p7` - Slowest (highest quality)
-
-### Log Management
-```bash
-LOG_MAX_LINES="1000"  # Lines before rotation
-LOG_KEEP="5"          # Number of archives to keep
-```
 
 ## 📝 Version History
 
