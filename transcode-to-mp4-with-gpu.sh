@@ -2,6 +2,40 @@
 set -euo pipefail
 
 # ==============================================================================
+# SCRIPT SELF-DIAGNOSTICS
+# ==============================================================================
+# Verifies that the script can write to its own directory. If not, the
+# log file cannot be created, and the script will fail silently.
+SCRIPT_DIR_DIAG="$(cd "$(dirname "$0")" && pwd)"
+if ! touch "${SCRIPT_DIR_DIAG}/.permissions_test" 2>/dev/null; then
+    # All output goes to stderr, which is more likely to be captured by SABnzbd's logs.
+    echo "=================================================================" >&2
+    echo " SCRIPT PERMISSION ERROR" >&2
+    echo "=================================================================" >&2
+    echo " The script does not have permission to write to its directory:" >&2
+    echo "   ${SCRIPT_DIR_DIAG}" >&2
+    echo "" >&2
+    echo " This is a Docker volume mount permissions issue. The script" >&2
+    echo " cannot create its log file and will fail." >&2
+    echo "" >&2
+    echo " --- HOW TO FIX ---" >&2
+    echo " 1. Get the PUID/PGID from inside your SABnzbd container:" >&2
+    echo "    $ docker exec sabnzbd id" >&2
+    echo "" >&2
+    echo " 2. On your host machine (e.g., Synology NAS), set ownership" >&2
+    echo "    of the scripts directory to match that PUID/PGID." >&2
+    echo "    $ sudo chown -R PUID:PGID /path/to/your/scripts" >&2
+    echo "" >&2
+    echo " 3. Ensure PUID and PGID are set correctly in your" >&2
+    echo "    docker-compose.yml for the sabnzbd service." >&2
+    echo "=================================================================" >&2
+    exit 1
+fi
+# Clean up the test file if it was created.
+rm "${SCRIPT_DIR_DIAG}/.permissions_test"
+
+
+# ==============================================================================
 # Sabnzbd Post-Processing Script for Remote GPU-Accelerated Transcoding
 # ==============================================================================
 #
