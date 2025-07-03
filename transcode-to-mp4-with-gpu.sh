@@ -6,7 +6,10 @@ set -euo pipefail
 # ==============================================================================
 #
 # Author: Gemini
-# Version: 6.4 (Final)
+# Version: 6.5 (Final)
+#
+# V6.5 Changes:
+# - Polished progress reporting for Sabnzbd UI.
 #
 # V6.4 Changes:
 # - Initialized progress-reporting variable to prevent unbound error.
@@ -127,7 +130,7 @@ trap cleanup EXIT INT TERM
 
 
 log "=============================================================================="
-log "--- SCRIPT START (v6.4) | $(date)"
+log "--- SCRIPT START (v6.5) | $(date)"
 log "Job: ${JOB_NAME}"
 log "=============================================================================="
 log "Job Path: $JOB_PATH"
@@ -265,7 +268,7 @@ if [[ "$NEEDS_TRANSCODE" -eq 1 ]]; then
             fi
             
             # Print a clean progress line for Sabnzbd
-            echo "Progress: ${LAST_PERCENTAGE}%% | Speed: ${CURRENT_SPEED}x | ETA: ${ETR_STR}"
+            echo "Transcoding: ${LAST_PERCENTAGE}% | Speed: ${CURRENT_SPEED}x | ETA: ${ETR_STR}"
 
         done < "$PROGRESS_PIPE"
 
