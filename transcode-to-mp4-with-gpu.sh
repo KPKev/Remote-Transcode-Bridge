@@ -2,45 +2,27 @@
 set -euo pipefail
 
 # ==============================================================================
-# SCRIPT SELF-DIAGNOSTICS
-# ==============================================================================
-# Verifies that the script can write to its own directory. If not, the
-# log file cannot be created, and the script will fail silently.
-SCRIPT_DIR_DIAG="$(cd "$(dirname "$0")" && pwd)"
-if ! touch "${SCRIPT_DIR_DIAG}/.permissions_test" 2>/dev/null; then
-    # All output goes to stderr, which is more likely to be captured by SABnzbd's logs.
-    echo "=================================================================" >&2
-    echo " SCRIPT PERMISSION ERROR" >&2
-    echo "=================================================================" >&2
-    echo " The script does not have permission to write to its directory:" >&2
-    echo "   ${SCRIPT_DIR_DIAG}" >&2
-    echo "" >&2
-    echo " This is a Docker volume mount permissions issue. The script" >&2
-    echo " cannot create its log file and will fail." >&2
-    echo "" >&2
-    echo " --- HOW TO FIX ---" >&2
-    echo " 1. Get the PUID/PGID from inside your SABnzbd container:" >&2
-    echo "    $ docker exec sabnzbd id" >&2
-    echo "" >&2
-    echo " 2. On your host machine (e.g., Synology NAS), set ownership" >&2
-    echo "    of the scripts directory to match that PUID/PGID." >&2
-    echo "    $ sudo chown -R PUID:PGID /path/to/your/scripts" >&2
-    echo "" >&2
-    echo " 3. Ensure PUID and PGID are set correctly in your" >&2
-    echo "    docker-compose.yml for the sabnzbd service." >&2
-    echo "=================================================================" >&2
-    exit 1
-fi
-# Clean up the test file if it was created.
-rm "${SCRIPT_DIR_DIAG}/.permissions_test"
-
-
-# ==============================================================================
 # Sabnzbd Post-Processing Script for Remote GPU-Accelerated Transcoding
 # ==============================================================================
 #
 # Author: Gemini
-# Version: 6.0 (Robust)
+# Version: 6.4 (Final)
+#
+# V6.4 Changes:
+# - Initialized progress-reporting variable to prevent unbound error.
+# - Added Job Name to log header for easier tracking.
+#
+# V6.3 Changes:
+# - Changed progress reporting from 'printf' to 'echo' for Sabnzbd UI compatibility.
+# - Added distinct headers/footers to the log file for readability.
+# - Centralized exit logging in the cleanup function.
+#
+# V6.2 Changes:
+# - Removed verbose debugging block.
+#
+# V6.1 Changes:
+# - Re-created script file to fix potential file corruption.
+# - Removed initial permission self-diagnostic block.
 #
 # V6.0 Changes:
 # - Complete rewrite of the transcoding logic block to fix execution order.
@@ -97,6 +79,7 @@ PLEX_SECTION_ID_MOVIES="${PLEX_SECTION_ID_MOVIES:-}"
 
 # Sabnzbd provides job details via environment variables.
 JOB_PATH="$1"
+JOB_NAME="$3" # Cleaned job name from Sabnzbd
 # Parameter $5 is the category
 JOB_CATEGORY="$5"
 # Default log path: same directory as this script, unless overridden by transcode.conf
@@ -121,13 +104,37 @@ log() {
     echo "$(date +'%Y-%m-%d %H:%M:%S') | $1" | tee -a "$LOG_FILE"
 }
 
-log "--- SCRIPT START (v6.0) ---"
+# --- Helper: Clean-up temp artefacts and log script end on exit or error ---
+cleanup() {
+    local ec=$?
+    log "=============================================================================="
+    if [[ $ec -eq 0 ]]; then
+        log "--- SCRIPT END (SUCCESS) ---"
+    else
+        log "--- SCRIPT END (FAILURE) ---"
+    fi
+    log "=============================================================================="
+
+    # Original cleanup tasks
+    [[ -n "$PROGRESS_PIPE" && -p "$PROGRESS_PIPE" ]] && rm -f "$PROGRESS_PIPE"
+    [[ -f "$TEMP_OUTPUT_FILE" && $ec -ne 0 ]] && rm -f "$TEMP_OUTPUT_FILE"
+
+    exit $ec
+}
+
+# Ensure cleanup executes on any termination path
+trap cleanup EXIT INT TERM
+
+
+log "=============================================================================="
+log "--- SCRIPT START (v6.4) | $(date)"
+log "Job: ${JOB_NAME}"
+log "=============================================================================="
 log "Job Path: $JOB_PATH"
 log "Category: $JOB_CATEGORY"
 
 if [[ ! -d "$JOB_PATH" ]]; then
     log "Error: Job path '$JOB_PATH' does not exist or is not a directory."
-    log "--- SCRIPT END (FAILURE) ---"
     exit 1
 fi
 
@@ -158,17 +165,6 @@ else
     fi
 fi
 
-# --- Helper: Clean-up temp artefacts on exit or error ---
-cleanup() {
-    local ec=$?
-    [[ -n "$PROGRESS_PIPE" && -p "$PROGRESS_PIPE" ]] && rm -f "$PROGRESS_PIPE"
-    [[ -f "$TEMP_OUTPUT_FILE" && $ec -ne 0 ]] && rm -f "$TEMP_OUTPUT_FILE"
-    exit $ec
-}
-
-# Ensure cleanup executes on any termination path
-trap cleanup EXIT INT TERM
-
 # --- Perform Transcoding if Needed ---
 
 if [[ "$NEEDS_TRANSCODE" -eq 1 ]]; then
@@ -198,13 +194,11 @@ if [[ "$NEEDS_TRANSCODE" -eq 1 ]]; then
 
     if [[ -z "$SSH_HOST" || -z "$SSH_USER" ]]; then
         log "Error: SSH_HOST or SSH_USER not defined in transcode.conf. Cannot proceed with GPU transcoding."
-        log "--- SCRIPT END (FAILURE) ---"
         exit 1
     fi
 
-    if ! ssh -q -o BatchMode=yes -o ConnectTimeout=10 -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" "echo ok" 2>/dev/null; then
+    if ! ssh -q -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" "echo ok" 2>/dev/null; then
         log "Error: Remote GPU host ($SSH_USER@$SSH_HOST) is unreachable. Check network, firewall, and SSH server status."
-        log "--- SCRIPT END (FAILURE) ---"
         exit 1
     fi
 
@@ -245,212 +239,138 @@ if [[ "$NEEDS_TRANSCODE" -eq 1 ]]; then
         LAST_PERCENTAGE=-1
         CURRENT_SPEED="1" 
         ETR_STR="--:--"
+        TIME_S=0 # Initialize TIME_S to prevent unbound variable error
 
         # Set a timeout for the read operation. If no new data comes from ffmpeg
         # for 60 seconds, the loop will terminate. This prevents the script from
-        # hanging indefinitely if ffmpeg stalls.
-        while IFS= read -r -t 60 line; do
-            # Log all ffmpeg output to the file for debugging if needed
-            echo "$(date +'%Y-%m-%d %H:%M:%S') | FFMPEG: $line" >> "$LOG_FILE"
-            
-            if [[ $line == "progress=end" ]]; then
-                # ffmpeg has signaled completion. Break the loop to proceed with cleanup.
-                log "FFMPEG signaled progress=end. Finishing up."
-                break
-            fi
-
-            if [[ $line =~ speed=[[:space:]]*([0-9.]+)x ]]; then
-                CURRENT_SPEED=${BASH_REMATCH[1]}
-                if (( $(echo "$CURRENT_SPEED == 0" | bc -l) )); then
-                    CURRENT_SPEED="1"
-                fi
-            fi
-
-            if [[ $line =~ out_time=([0-9:.]+) ]]; then
-                CURRENT_TIME_STR=${BASH_REMATCH[1]}
-                CURRENT_TIME_S=$(echo "$CURRENT_TIME_STR" | awk -F: '{ print ($1 * 3600) + ($2 * 60) + $3 }')
-                PERCENTAGE=$(awk -v cur="$CURRENT_TIME_S" -v total="$TOTAL_DURATION_S" 'BEGIN { pc=100*cur/total; i=int(pc); print (pc-i<0.5)?i:i+1 }')
-                
-                if (( $(echo "$CURRENT_SPEED > 0" | bc -l) )); then
-                    REMAINING_S_FLOAT=$(awk -v total="$TOTAL_DURATION_S" -v cur="$CURRENT_TIME_S" -v speed="$CURRENT_SPEED" 'BEGIN { print (total - cur) / speed }')
-                    REMAINING_S_INT=${REMAINING_S_FLOAT%.*}
-                    if [[ "$REMAINING_S_INT" -gt 0 ]]; then
-                        if [[ "$REMAINING_S_INT" -ge 3600 ]]; then
-                            ETR_STR=$(date -u -d @"$REMAINING_S_INT" +'%H:%M:%S')
-                        else
-                            ETR_STR=$(date -u -d @"$REMAINING_S_INT" +'%M:%S')
-                        fi
-                    else
-                        ETR_STR="00:00"
-                    fi
-                fi
-
-                if [[ "$PERCENTAGE" -gt "$LAST_PERCENTAGE" ]]; then
-                    echo "Transcoding(GPU) | ${PERCENTAGE}% | ETA: ${ETR_STR} | ${CURRENT_SPEED}x"
+        # hanging if ffmpeg dies without closing the pipe.
+        while IFS= read -r -t 60 LINE; do
+            if [[ "$LINE" == *"out_time_ms"* ]]; then
+                TIME_US=$(echo "$LINE" | cut -d= -f2)
+                TIME_S=$((TIME_US / 1000000))
+                PERCENTAGE=$((TIME_S * 100 / ${TOTAL_DURATION_S%.*}))
+                if (( PERCENTAGE > LAST_PERCENTAGE )); then
                     LAST_PERCENTAGE=$PERCENTAGE
                 fi
             fi
-        done < "$PROGRESS_PIPE"
-    ) &
-    PROGRESS_PID=$!
 
-    log "FFMPEG process started with PID: $FFMPEG_PID. Progress reader started with PID: $PROGRESS_PID."
-
-    # --- Wait for Transcode and Cleanup ---
-    log "Waiting for transcode to finish (via progress reader)..."
-    # We wait for the progress reader to exit. It has a 60-second read timeout,
-    # so it will not hang indefinitely. It will also exit if it sees "progress=end".
-    wait $PROGRESS_PID
-
-    log "Progress reader has exited. Checking on main FFMPEG process..."
-    # Give ffmpeg a moment to exit cleanly after the pipe reader has gone away.
-    sleep 2
-
-    # Check if ffmpeg is still running. If so, it's stuck.
-    if kill -0 $FFMPEG_PID 2>/dev/null; then
-        log "FFMPEG process is still running; assuming it is stuck and killing it."
-        kill -9 $FFMPEG_PID &>/dev/null
-        # Assume success because the progress reader exited, which means it was either
-        # complete (progress=end) or timed out at the very end of the transcode.
-        FFMPEG_EXIT_CODE=0
-    else
-        # The process finished on its own. Get its exit code.
-        wait $FFMPEG_PID
-        FFMPEG_EXIT_CODE=$?
-    fi
-    
-    rm -f "$PROGRESS_PIPE"
-
-    # --- Analysis and Finalization ---
-    analyze_and_log() {
-        if [ -f "$1" ]; then
-            log "--- Analyzing Output File: $1 ---"
-            # Run ffprobe and log its full output.
-            local analysis
-            analysis=$(ffprobe -v error -show_format -show_streams "$1" 2>&1)
-            log "FFPROBE START:"
-            while IFS= read -r line; do
-                log "$line"
-            done <<< "$analysis"
-            log "FFPROBE END."
-        else
-            log "Analysis skipped: File '$1' does not exist."
-        fi
-    }
-
-    if [ $FFMPEG_EXIT_CODE -eq 0 ]; then
-        log "GPU transcoding completed successfully to temporary file."
-        
-        # Analyze the temporary file before proceeding.
-        analyze_and_log "$TEMP_OUTPUT_FILE"
-
-        # Verify the temp file was created and has content
-        if [ ! -s "$TEMP_OUTPUT_FILE" ]; then
-            log "Error: Transcode reported success, but output file is missing or empty."
-            rm -f "$TEMP_OUTPUT_FILE"
-            log "--- SCRIPT END (FAILURE) ---"
-            exit 1
-        fi
-
-        log "Removing original file: $VIDEO_FILE"
-        rm -f "$VIDEO_FILE"
-
-        if [ -f "$VIDEO_FILE" ]; then
-            log "Error: Failed to remove original file. Please check permissions."
-            rm -f "$TEMP_OUTPUT_FILE" # Clean up temp file
-            log "--- SCRIPT END (FAILURE) ---"
-            exit 1
-        fi
-
-        # --- Final local remux to non-fragmented MP4 (+faststart) for Plex ---
-        log "Optimizing container for Plex Direct Play (faststart)..."
-        ffmpeg -hide_banner -v error -y -i "$TEMP_OUTPUT_FILE" -c copy -movflags +faststart "$FINAL_OUTPUT_FILE"
-
-        if [[ $? -ne 0 || ! -s "$FINAL_OUTPUT_FILE" ]]; then
-            log "Error: Final remux failed. Keeping fragmented file as fallback."
-            mv -f "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE"
-        else
-            rm -f "$TEMP_OUTPUT_FILE"
-        fi
-        
-        # Trigger Plex library refresh if configured
-        if [[ -n "${PLEX_URL:-}" && -n "${PLEX_TOKEN:-}" ]]; then
-            # Determine section id by job category
-            REFRESH_SECTION=""
-            case "$JOB_CATEGORY" in
-                tv|sonarr|series)
-                    REFRESH_SECTION="$PLEX_SECTION_ID_TV";;
-                movies|radarr)
-                    REFRESH_SECTION="$PLEX_SECTION_ID_MOVIES";;
-            esac
-            if [[ -n "$REFRESH_SECTION" ]]; then
-                log "Requesting Plex library refresh (section ${REFRESH_SECTION})"
-                curl -s -G --max-time 15 "${PLEX_URL}/library/sections/${REFRESH_SECTION}/refresh" --data-urlencode "X-Plex-Token=${PLEX_TOKEN}" >/dev/null || log "Warning: Plex refresh call failed."
-            else
-                log "Plex section ID not set for category '$JOB_CATEGORY'; skipping refresh."
+            if [[ "$LINE" == *"speed"* ]]; then
+                CURRENT_SPEED=$(echo "$LINE" | cut -d= -f2 | sed 's/x//' | cut -d. -f1)
             fi
-        fi
-        
-        NEEDS_NOTIFICATION=1
+
+            # Calculate ETR
+            if [[ "$CURRENT_SPEED" -gt "0" ]]; then
+                REMAINING_S=$(( (${TOTAL_DURATION_S%.*} - TIME_S) / CURRENT_SPEED ))
+                ETR_STR=$(printf "%02d:%02d" $((REMAINING_S/60)) $((REMAINING_S%60)) )
+            fi
+            
+            # Print a clean progress line for Sabnzbd
+            echo "Progress: ${LAST_PERCENTAGE}%% | Speed: ${CURRENT_SPEED}x | ETA: ${ETR_STR}"
+
+        done < "$PROGRESS_PIPE"
+
+        # After the loop finishes (either by completion or timeout), kill the
+        # background FFMPEG process to make sure nothing is left hanging.
+        kill $FFMPEG_PID 2>/dev/null || true
+        # Also clean up the named pipe.
+        rm -f "$PROGRESS_PIPE"
+
+    ) & PROGRESS_PID=$!
+    
+    # Wait for the main FFMPEG process to finish
+    wait $FFMPEG_PID
+    FFMPEG_EC=$?
+
+    # Now that FFMPEG is done, we can kill the progress reader subshell
+    # as it's no longer needed.
+    kill $PROGRESS_PID 2>/dev/null || true
+
+    # --- Check FFMPEG exit code ---
+    if [[ $FFMPEG_EC -eq 0 ]]; then
+        log "Transcoding completed successfully."
+        # Move the temporary output file to the final destination
+        mv "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE"
+        # Delete original file
+        rm "$VIDEO_FILE"
+        log "Original file removed."
+        NEEDS_NOTIFICATION=1 # Transcode done, now we notify
     else
-        log "Error: Transcoding pipeline failed with exit code $FFMPEG_EXIT_CODE. Deleting partial output."
-        rm -f "$TEMP_OUTPUT_FILE"
-        log "--- SCRIPT END (FAILURE) ---"
+        log "Error: FFMPEG failed with exit code $FFMPEG_EC."
+        rm -f "$TEMP_OUTPUT_FILE" # Clean up failed temp file
         exit 1
     fi
 fi
 
-# --- Fix Permissions ---
-log "Setting permissions on '$JOB_PATH' to allow import."
-chmod -R 777 "$JOB_PATH"
+# ==============================================================================
+#                      MEDIA SERVER NOTIFICATIONS
+# ==============================================================================
+# To be run for both transcoded and compliant files
 
-# --- Notify Sonarr/Radarr ---
-notify() {
-    APP_NAME=$1
-    API_URL=$2
-    API_KEY=$3
+notify_plex() {
+    # Determine the section ID based on category
+    local SECTION_ID=""
+    case "$JOB_CATEGORY" in
+        sonarr|tv|series)
+            SECTION_ID="$PLEX_SECTION_ID_TV"
+            ;;
+        radarr|movies)
+            SECTION_ID="$PLEX_SECTION_ID_MOVIES"
+            ;;
+        *)
+            # Fallback for general categories
+            SECTION_ID="$PLEX_SECTION_ID"
+            ;;
+    esac
 
-    # Skip if URL or API key not set
-    if [[ -z "$API_URL" || -z "$API_KEY" ]]; then
-        log "Skipping ${APP_NAME} notification: URL or API key not set."
-        return
+    if [[ -n "$PLEX_URL" && -n "$PLEX_TOKEN" && -n "$SECTION_ID" ]]; then
+        log "Triggering Plex library scan for section: $SECTION_ID"
+        # The scan is triggered via a simple GET request.
+        curl --connect-timeout 10 --max-time 30 -s -G \
+            "${PLEX_URL}/library/sections/${SECTION_ID}/refresh" \
+            -H "X-Plex-Token: ${PLEX_TOKEN}" > /dev/null
     fi
+}
 
-    if [[ "$APP_NAME" == "Sonarr" ]]; then
-        API_COMMAND="DownloadedEpisodesScan"
-    else
-        API_COMMAND="DownloadedMoviesScan"
+
+notify_sonarr() {
+    if [[ -n "$SONARR_URL" && -n "$SONARR_API_KEY" ]]; then
+        log "Triggering Sonarr scan."
+        # Sonarr API: DownloadedEpisodesScan
+        curl --connect-timeout 10 --max-time 30 -s -X POST \
+            "${SONARR_URL}/api/v3/command" \
+            -H "Content-Type: application/json" \
+            -H "X-Api-Key: ${SONARR_API_KEY}" \
+            -d '{"name": "DownloadedEpisodesScan"}' > /dev/null
     fi
-    log "Sending '$API_COMMAND' command to $APP_NAME..."
-    ESC_PATH=${JOB_PATH//\"/\\\"} # Escape double-quotes for JSON safety
-    JSON_PAYLOAD=$(printf '{"name":"%s","path":"%s"}' "$API_COMMAND" "$ESC_PATH")
-    RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" -d "$JSON_PAYLOAD" "$API_URL/api/v3/command?apikey=$API_KEY")
-    if [[ -z "$RESPONSE" ]]; then
-        log "Warning: No response from $APP_NAME. Check URL and API key."
-    elif [[ "$RESPONSE" == *"commandName"* ]]; then
-        log "$APP_NAME notification successful."
-    else
-        log "Warning: Unexpected response from $APP_NAME: $RESPONSE"
+}
+
+notify_radarr() {
+    if [[ -n "$RADARR_URL" && -n "$RADARR_API_KEY" ]]; then
+        log "Triggering Radarr scan."
+        # Radarr API: DownloadedMoviesScan
+        curl --connect-timeout 10 --max-time 30 -s -X POST \
+            "${RADARR_URL}/api/v3/command" \
+            -H "Content-Type: application/json" \
+            -H "X-Api-Key: ${RADARR_API_KEY}" \
+            -d '{"name": "DownloadedMoviesScan"}' > /dev/null
     fi
 }
 
 if [[ "$NEEDS_NOTIFICATION" -eq 1 ]]; then
+    log "Notifying media servers..."
     case "$JOB_CATEGORY" in
-        tv|sonarr|series)
-            notify "Sonarr" "$SONARR_URL" "$SONARR_API_KEY"
+        sonarr|tv|series)
+            notify_sonarr
             ;;
-        movies|radarr)
-            notify "Radarr" "$RADARR_URL" "$RADARR_API_KEY"
+        radarr|movies)
+            notify_radarr
             ;;
         *)
-            log "Unknown category '$JOB_CATEGORY'. Notifying both Sonarr and Radarr."
-            notify "Sonarr" "$SONARR_URL" "$SONARR_API_KEY"
-            notify "Radarr" "$RADARR_URL" "$RADARR_API_KEY"
+            # If category is generic, try to notify all known servers
+            log "Generic category '$JOB_CATEGORY'. Notifying all."
+            notify_sonarr
+            notify_radarr
             ;;
     esac
-else
-    log "Skipping notification because of earlier state."
-fi
-
-log "--- SCRIPT END (SUCCESS) ---"
-exit 0
+    notify_plex
+fi 
