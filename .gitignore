@@ -1,0 +1,9 @@
+# Log files
+logs/*.log
+*.log
+
+# Progress pipes
+*.pipe
+
+# Old script versions
+transcode-v2-working-great-no-progress-is-showing-tho.sh 
