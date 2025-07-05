@@ -1,17 +1,18 @@
 # Unified GPU & CPU Transcoding Script for Sabnzbd
 
-A robust, single-file post-processing script for Sabnzbd that intelligently transcodes media to a web-optimized MP4 format. It prioritizes a remote NVIDIA GPU for maximum speed but automatically falls back to local CPU transcoding if the GPU is unavailable, ensuring your media always gets processed.
+This is a robust, single-file post-processing script for Sabnzbd that intelligently transcodes media files into a web-optimized MP4 format. It is designed for maximum efficiency and reliability, prioritizing a high-speed remote NVIDIA GPU for transcoding while providing a seamless, automatic fallback to local CPU processing if the GPU is unavailable.
+
+This ensures that your media is always processed and ready for your library, regardless of the status of your remote hardware.
 
 ## 🚀 Key Features
 
-- **Hybrid Transcoding**: Prioritizes remote NVIDIA GPU (NVENC) via SSH and seamlessly falls back to local CPU (`libx264`) if needed.
-- **Intelligent Fallback**: Automatically detects if the remote GPU host is unreachable and switches to CPU mode.
-- **Force CPU Option**: A flag in `transcode.conf` allows you to force CPU transcoding for testing or maintenance.
-- **Real-time Progress**: A live, responsive progress bar with a "spinner" shows that transcoding is active, even during slow CPU operations.
-- **Automatic Format Detection**: Only transcodes files that aren't already in a web-optimized MP4 format.
-- **Media Server Integration**: Built-in, automatic library refresh notifications for Plex, Sonarr, and Radarr.
-- **Highly Configurable**: A clean `transcode.conf` file controls all quality, connection, and behavior settings.
-- **Comprehensive Logging**: Creates detailed, timestamped logs for both the main script and the `ffmpeg` process, with automatic rotation.
+- **Hybrid Transcoding Logic**: Prioritizes remote NVIDIA GPU (NVENC) via SSH for maximum speed.
+- **Automatic CPU Fallback**: If the remote GPU host is unreachable (or disabled), the script automatically switches to the local CPU (`libx264`) to complete the job. No intervention required.
+- **Live Progress Reporting**: The script provides a real-time progress bar in the Sabnzbd UI, complete with a "spinner" to show activity, percentage complete, current speed (e.g., `2.5x`), and an estimated time remaining (ETA).
+- **Intelligent Transcoding**: Uses `ffprobe` to analyze files and only transcodes what is necessary, saving resources by skipping files that are already in a compliant format.
+- **Media Server Integration**: After a successful transcode, it automatically sends notifications to Sonarr, Radarr, and Plex to trigger library scans and updates.
+- **Detailed, Rotated Logging**: Creates separate, timestamped log files for the main script and the `ffmpeg` process, and automatically rotates them to save space.
+- **Highly Configurable**: All behavior, from quality settings to server addresses, is controlled via a simple, clean `transcode.conf` file.
 
 ## 📋 Requirements
 
@@ -37,83 +38,59 @@ A robust, single-file post-processing script for Sabnzbd that intelligently tran
 3.  **Configure**: Edit `transcode.conf` with your specific settings (SSH, media servers, etc.).
 4.  **Setup in Sabnzbd**: In Sabnzbd's settings, point your categories to `transcode-to-mp4-with-gpu.sh`.
 
+## 📁 File Structure
+
+All files should be placed in your Sabnzbd `scripts` directory.
+
+```
+/your-sabnzbd-config/scripts/
+├── transcode-to-mp4-with-gpu.sh  # The main, executable script.
+├── transcode.conf                # All user settings go here.
+└── logs/                         # All log files are created here automatically.
+```
+
 ## ⚙️ Configuration (`transcode.conf`)
 
-All script behavior is controlled by `transcode.conf`.
+This file controls all aspects of the script. Any variable set here will override the script's internal defaults.
 
-<details>
-<summary><strong>SSH / Remote GPU Configuration</strong></summary>
+### Remote GPU Settings
+These settings are for connecting to the remote machine that will perform the high-speed NVENC transcoding.
 
-```bash
-# IP or hostname of Windows box running NVENC
-SSH_HOST="192.168.7.16"
-# SSH port (22 by default)
-SSH_PORT="22"
-# SSH login user
-SSH_USER="12227"
-# Private key path inside container
-SSH_KEY="/config/.ssh/id_rsa"
-```
-</details>
+- `SSH_HOST`: The IP address or hostname of your GPU machine.
+- `SSH_PORT`: The SSH port on the remote machine (default: `22`).
+- `SSH_USER`: The username to log in with.
+- `SSH_KEY`: The absolute path *inside the Sabnzbd container* to the SSH private key for authentication.
 
-<details>
-<summary><strong>Encoding & Quality Settings</strong></summary>
+### Transcoding Quality
+Control the output quality of the transcoded files.
 
-```bash
-# Average bitrate target (VBR-HQ) for GPU
-BITRATE_TARGET="6M"
-# Peak maxrate for GPU
-BITRATE_MAX="8M"
-# Rate-control buffer for GPU
-BITRATE_BUFSIZE="16M"
-# Max output resolution (widthxheight)
-RESOLUTION_MAX="1920x1080"
-# Quality preset for h264_nvenc (p1-p7, p4 is a good balance)
-NVENC_PRESET="p4"
-```
-</details>
+- `BITRATE_TARGET`: The target average bitrate for GPU transcodes (e.g., `6M`).
+- `BITRATE_MAX`: The maximum allowed peak bitrate for GPU transcodes (e.g., `8M`).
+- `BITRATE_BUFSIZE`: The video buffer verifier size for GPU transcodes (e.g., `16M`).
+- `RESOLUTION_MAX`: The maximum output resolution (e.g., `1920x1080`). Videos with a higher resolution will be downscaled.
+- `NVENC_PRESET`: The quality preset for the NVIDIA encoder. Ranges from `p1` (fastest, lowest quality) to `p7` (slowest, highest quality). `p4` is a good balance.
 
-<details>
-<summary><strong>Media Server Integration</strong></summary>
+### Transcoding Rules
+Define which files the script should process.
 
-```bash
-SONARR_URL="http://sonarr:8989"
-SONARR_API_KEY="your_api_key"
-RADARR_URL="http://radarr:7878"
-RADARR_API_KEY="your_api_key"
-PLEX_URL="http://plex:32400"
-PLEX_TOKEN="your_plex_token"
-PLEX_SECTION_ID_TV="2"
-PLEX_SECTION_ID_MOVIES="1"
-```
-</details>
+- `SOURCE_CODECS`: A space-separated list of video codecs that should trigger a transcode (e.g., `"h265 hevc"`).
+- `CONVERT_MKV`: Set to `true` to transcode `.mkv` files, `false` to ignore them.
+- `MIN_SIZE`: The minimum file size in bytes to consider for transcoding. This is useful for ignoring sample files (default: `104857600`, i.e., 100MB).
 
-<details>
-<summary><strong>Transcoding Rules & Behavior</strong></summary>
+### Media Server Integration
+Settings for notifying your media servers after a transcode is complete.
 
-```bash
-# Set to "true" to skip the GPU check and force local CPU transcoding.
-# Default: false
-FORCE_CPU_TRANSCODE="true"
+- `SONARR_URL` / `SONARR_API_KEY`: Your Sonarr instance details.
+- `RADARR_URL` / `RADARR_API_KEY`: Your Radarr instance details.
+- `PLEX_URL` / `PLEX_TOKEN`: Your Plex server details.
+- `PLEX_SECTION_ID_TV` / `PLEX_SECTION_ID_MOVIES`: The specific library section keys in Plex that should be refreshed.
 
-# (Currently Ineffective) Set to "true" to attempt VAAPI hardware
-# acceleration on the local CPU (e.g., on a Synology NAS).
-# Requires docker access to /dev/dri.
-# Default: false
-ENABLE_CPU_HW_ACCEL="true"
+### Logging
+- `LOG_KEEP`: The number of old log files to keep during rotation (default: `10`).
 
-# A space-separated list of video codecs to transcode.
-SOURCE_CODECS="h265 hevc"
-
-# Set to "true" to transcode Matroska (.mkv) files.
-CONVERT_MKV="true"
-
-# Any video file smaller than this size (in bytes) will be skipped.
-# Default is 100MB (104857600).
-MIN_SIZE="104857600"
-```
-</details>
-
+### Advanced / Testing
+- `FORCE_CPU_TRANSCODE`: Set to `true` to completely bypass the GPU check and force all transcoding to happen on the local CPU. Useful for testing.
+- `ENABLE_CPU_HW_ACCEL`: **(Experimental)** Set to `true` to attempt using VAAPI hardware acceleration on the local CPU (e.g., for Intel QSV on a Synology NAS). This is currently disabled in the main script due to driver compatibility issues but can be re-enabled for testing.
 
 ## 🔄 How It Works
 
@@ -129,27 +106,45 @@ MIN_SIZE="104857600"
 5.  **Progress Monitoring**: While `ffmpeg` runs, a progress loop reads its output in real-time, printing a status line with a spinner, percentage, speed, and ETA to the Sabnzbd UI.
 6.  **Cleanup & Notification**: After a successful transcode, the original file is deleted, and the script sends API calls to Sonarr, Radarr, and Plex to trigger library scans.
 
-## 📁 File Structure
+## 📜 Logging System Explained
 
-```
-/sabnzbd/scripts/
-├── transcode-to-mp4-with-gpu.sh  # The main, unified script
-├── transcode.conf                # All user configuration
-├── logs/                         # Directory for log files
-│   ├── ..._main.log              # Main script activity log
-│   └── ..._cpu.log               # Log file for ffmpeg CPU process
-└── .gitignore                    # Prevents logs from being committed
-```
+The script features a robust logging system to make troubleshooting easy.
+
+- **Location**: All logs are created in the `logs` sub-directory.
+- **File Naming**: Log files are named using the format: `YYYY-MM-DD_HH-MM-SS_Job-Name_type.log`.
+  - `..._main.log`: Contains the high-level output of the script itself—what decisions it made, when it started/stopped, and any major errors.
+  - `..._cpu.log` or `..._gpu.log`: Contains the raw, unfiltered output from the `ffmpeg` process. If an encode fails, the specific error will be in this file.
+- **Log Rotation**: To prevent logs from filling up your disk, the script automatically deletes the oldest log files, keeping only the number specified by `LOG_KEEP` in `transcode.conf`.
+
+## 📊 Progress Reporting
+
+To provide real-time feedback, the script reports progress directly to the Sabnzbd UI.
+
+- **Live Spinner**: A spinning character `[|]`, `[/]`, `[-]`, `[\]` updates continuously, providing a "heartbeat" to show that the script is alive and receiving data, even if the percentage hasn't changed.
+- **Real-time Updates**: The script uses `stdbuf` to force line-buffering on `ffmpeg`'s output. This ensures that progress updates are displayed the instant they are available, rather than waiting for a buffer to fill, which results in a much smoother and more responsive ETA calculation.
 
 ## 🐛 Troubleshooting
 
-- **Frozen Progress Bar**: If the progress bar freezes, check the main log file (`..._main.log`) in the `logs` directory. The progress reader may have timed out (default is 5 minutes).
-- **Transcoding Fails**: Check the `ffmpeg` log (`..._cpu.log` or a future `..._gpu.log`). This contains the direct, unfiltered output from the `ffmpeg` command and will show any encoding errors.
-- **SSH Connection Fails**: Test your SSH connection manually from within the Sabnzbd container to ensure keys are set up correctly and the host is reachable. `ssh -v -p [PORT] [USER]@[HOST]`.
-- **Permission Denied**: Ensure the script has execute permissions (`chmod +x`). Also, ensure the user running Sabnzbd has permission to write to the `logs` directory and the media output directories.
+1.  **Transcode Fails or Stalls**:
+    - **Check the `ffmpeg` log first (`..._cpu.log` or `..._gpu.log`)**. This is the most important step. It contains the raw error message from `ffmpeg` (e.g., "Error creating a MFX session," "No such file or directory," "Permission denied").
+    - **Check the `main` log (`..._main.log`)**. This will tell you which decisions the script made and if it encountered a script-level error (like being unable to find a video file).
+
+2.  **Progress Bar Freezes**:
+    - The script's progress reader has a long timeout (300 seconds). If it freezes, it's very likely that the `ffmpeg` process itself has stalled or crashed. Check the `ffmpeg` log for errors.
+
+3.  **Permission Denied Errors**:
+    - Ensure the script has execute permissions: `chmod +x transcode-to-mp4-with-gpu.sh`.
+    - Ensure the user running Sabnzbd has read/write permissions for the download directory and the `scripts/logs` directory.
+
+4.  **SSH Connection Issues**:
+    - From inside your Sabnzbd container, run a manual SSH command to test the connection: `ssh -v -p [PORT] -i [KEY_PATH] [USER]@[HOST]`. The `-v` (verbose) flag will give you detailed output to diagnose authentication or connectivity problems.
+
+5.  **File Is Skipped (Not Transcoded)**:
+    - Check the `main` log. It will explicitly state why a file was skipped.
+    - Verify your rules in `transcode.conf`. Is the file's codec in `SOURCE_CODECS`? Is the file larger than `MIN_SIZE`? Is `CONVERT_MKV` set to `true`?
 
 ---
-**Author**: Gemini & KPKev  
+**Author**: Gemini & KPKev
 **Version**: 3.0 (Unified)
 
 ## 📝 Version History
