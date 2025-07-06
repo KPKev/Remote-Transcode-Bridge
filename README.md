@@ -81,6 +81,14 @@ This is the core of the new system.
 ### Logging
 - `LOG_KEEP`: The number of old log files to keep during rotation (default: `10`).
 
+### Media Server Integration
+- `SONARR_URL` / `SONARR_API_KEY`: Details for your Sonarr instance.
+- `RADARR_URL` / `RADARR_API_KEY`: Details for your Radarr instance.
+- `PLEX_URL` / `PLEX_TOKEN`: Details for your Plex Media Server.
+- `PLEX_SECTION_ID_TV` / `PLEX_SECTION_ID_MOVIES`: The specific library section IDs in Plex to refresh for TV shows and movies.
+- `TAUTULLI_URL` / `TAUTULLI_API_KEY`: Optional details for your Tautulli instance to trigger a library sync.
+- `NOTIFICATION_DELAY_S`: How many seconds to wait after telling Sonarr/Radarr to import before telling Plex/Tautulli to scan. This prevents a race condition where Plex scans before the file is moved.
+
 ## 🔄 How It Works
 
 1.  **Analysis**: The script is triggered by Sabnzbd and finds the largest video file in the completed download. It uses `ffprobe` to check its container, video codec, and audio streams.
@@ -94,7 +102,11 @@ This is the core of the new system.
     - If the chosen transcoder runs and finishes successfully, the script moves on to finalizing the file. The loop is broken.
     - If the transcoder fails, the script logs the failure and automatically proceeds to the *next* transcoder in the priority list.
 5.  **Progress Monitoring**: While `ffmpeg` runs (locally or remotely), a universal progress loop reads its status, providing a consistent, real-time status line in the Sabnzbd UI.
-6.  **Finalization**: After a successful transcode, the temporary file is renamed, the original is deleted, and the script sends notifications to your media servers.
+6.  **Finalization & Notification**:
+    - After a successful transcode, the temporary file is renamed and the original is deleted.
+    - The script then notifies the appropriate service (Sonarr for TV, Radarr for movies) to import the new file.
+    - It waits for the configured delay (`NOTIFICATION_DELAY_S`).
+    - Finally, it tells Plex and Tautulli to scan their libraries for the new content.
 7.  **Failure**: If all enabled transcoders in the priority list fail, the script exits and leaves the original file intact.
 
 ## 🐛 Troubleshooting
@@ -146,6 +158,6 @@ For issues and questions:
 
 ---
 
-**Author**: Gemini  
+**Author**: Gemini & KPKev
 **Version**: 6.0 (Robust)  
-**Last Updated**: 2024 
+**Last Updated**: 2025 

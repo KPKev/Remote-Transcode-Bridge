@@ -64,6 +64,9 @@ PLEX_TOKEN="${PLEX_TOKEN:-}"
 PLEX_SECTION_ID_TV="${PLEX_SECTION_ID_TV:-}"
 PLEX_SECTION_ID_MOVIES="${PLEX_SECTION_ID_MOVIES:-}"
 PLEX_SECTION_ID="${PLEX_SECTION_ID:-}" # Legacy, for compatibility
+TAUTULLI_URL="${TAUTULLI_URL:-}"
+TAUTULLI_API_KEY="${TAUTULLI_API_KEY:-}"
+NOTIFICATION_DELAY_S="${NOTIFICATION_DELAY_S:-45}"
 
 # --- Sabnzbd Environment Variables ---
 JOB_PATH="$1"
@@ -320,10 +323,90 @@ run_local_cpu() {
     fi
 }
 
-# --- Sonarr/Radarr Refresh ---
+# --- Service Notifications ---
+notify_sonarr() {
+    if [ -n "$SONARR_URL" ] && [ -n "$SONARR_API_KEY" ]; then
+        log "Notifying Sonarr..."
+        DOWNLOAD_ID=$(basename "$JOB_PATH")
+        curl -sL -X POST "${SONARR_URL%/}/api/v3/command" \
+            -H "X-Api-Key: $SONARR_API_KEY" \
+            -d "{
+                \"name\": \"DownloadedEpisodesScan\",
+                \"path\": \"$JOB_PATH\",
+                \"downloadClientId\": \"${DOWNLOAD_ID}\",
+                \"importMode\": \"Move\"
+            }" >/dev/null
+    fi
+}
+
+notify_radarr() {
+    if [ -n "$RADARR_URL" ] && [ -n "$RADARR_API_KEY" ]; then
+        log "Notifying Radarr..."
+        DOWNLOAD_ID=$(basename "$JOB_PATH")
+        curl -sL -X POST "${RADARR_URL%/}/api/v3/command" \
+            -H "X-Api-Key: $RADARR_API_KEY" \
+            -d "{
+                \"name\": \"DownloadedMoviesScan\",
+                \"path\": \"$JOB_PATH\",
+                \"downloadClientId\": \"${DOWNLOAD_ID}\",
+                \"importMode\": \"Move\"
+            }" >/dev/null
+    fi
+}
+
+notify_plex() {
+    local PLEX_SECTION=$1
+    if [ -n "$PLEX_URL" ] && [ -n "$PLEX_TOKEN" ] && [ -n "$PLEX_SECTION" ]; then
+        log "Notifying Plex to scan section $PLEX_SECTION..."
+        curl -sL -X GET "${PLEX_URL%/}/library/sections/${PLEX_SECTION}/refresh?X-Plex-Token=${PLEX_TOKEN}" >/dev/null
+    fi
+}
+
+notify_tautulli() {
+    local PLEX_SECTION=$1
+    if [ -n "$TAUTULLI_URL" ] && [ -n "$TAUTULLI_API_KEY" ] && [ -n "$PLEX_SECTION" ]; then
+        log "Notifying Tautulli to scan section $PLEX_SECTION..."
+        curl -sL -X GET "${TAUTULLI_URL%/}/api/v2?apikey=${TAUTULLI_API_KEY}&cmd=update_library&section_id=${PLEX_SECTION}" >/dev/null
+    fi
+}
+
 send_notification() {
-    # This function remains unchanged...
-    : # Placeholder for existing notification logic
+    log "--- Sending Notifications ---"
+    
+    # Sabnzbd can send category as name (movies) or number (1).
+    # This handles both cases.
+    case "$JOB_CATEGORY" in
+        *movie* | 1)
+            log "Category identified as 'Movie'."
+            notify_radarr
+            log "Waiting ${NOTIFICATION_DELAY_S} seconds for file to be moved before notifying Plex/Tautulli..."
+            sleep "$NOTIFICATION_DELAY_S"
+            notify_plex "$PLEX_SECTION_ID_MOVIES"
+            notify_tautulli "$PLEX_SECTION_ID_MOVIES"
+            ;;
+        *tv* | *show* | 2)
+            log "Category identified as 'TV Show'."
+            notify_sonarr
+            log "Waiting ${NOTIFICATION_DELAY_S} seconds for file to be moved before notifying Plex/Tautulli..."
+            sleep "$NOTIFICATION_DELAY_S"
+            notify_plex "$PLEX_SECTION_ID_TV"
+            notify_tautulli "$PLEX_SECTION_ID_TV"
+            ;;
+        *)
+            log "Unknown category: '${JOB_CATEGORY}'. Cannot send targeted notifications."
+            # Fallback: Try both if keys are present
+            notify_radarr
+            notify_sonarr
+            log "Waiting ${NOTIFICATION_DELAY_S} seconds for files to be moved before notifying Plex/Tautulli..."
+            sleep "$NOTIFICATION_DELAY_S"
+            # Fallback for Plex: use the legacy single ID if defined
+            if [ -n "$PLEX_SECTION_ID" ]; then
+                notify_plex "$PLEX_SECTION_ID"
+                notify_tautulli "$PLEX_SECTION_ID"
+            fi
+            ;;
+    esac
+    log "--- Notifications Complete ---"
 }
 
 # ==============================================================================
