@@ -439,8 +439,10 @@ notify_plex() {
 notify_tautulli() {
     local PLEX_SECTION=$1
     if [ -n "$TAUTULLI_URL" ] && [ -n "$TAUTULLI_API_KEY" ] && [ -n "$PLEX_SECTION" ]; then
-        log "Notifying Tautulli to scan section $PLEX_SECTION..."
-        curl -sL -X GET "${TAUTULLI_URL%/}/api/v2?apikey=${TAUTULLI_API_KEY}&cmd=update_library&section_id=${PLEX_SECTION}" >/dev/null
+        log "Notifying Tautulli to refresh its library list from Plex..."
+        # The 'update_library' command is from API v1. The v2 equivalent to poke Tautulli is 'refresh_libraries_list'.
+        # This command does not take a section_id, but it will trigger a refresh.
+        curl -sL -X GET "${TAUTULLI_URL%/}/api/v2?apikey=${TAUTULLI_API_KEY}&cmd=refresh_libraries_list" >/dev/null
     fi
 }
 
