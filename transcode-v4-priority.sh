@@ -1,8 +1,8 @@
-#!/bin/sh
-set -eu
+#!/bin/bash
+set -euo pipefail
 
 # ==============================================================================
-# Sabnzbd Post-Processing Script: Transcode to MP4 (v4.0 + Recovery Patch)
+# Sabnzbd Post-Processing Script: Transcode to MP4 (v4.1 - Hardened Recovery)
 # ==============================================================================
 
 # --- Tell the system where to find binaries and libraries ---
@@ -62,6 +62,7 @@ JOB_NAME_SAFE=$(echo "$JOB_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g' | cut -c 1-50)
 LOG_FILE_BASE="${LOG_DIR}/${TIMESTAMP}_${JOB_NAME_SAFE}"
 MAIN_LOG_FILE="${LOG_FILE_BASE}_main.log"
 RECOVERY_LOG_PATH="${LOG_DIR}/${RECOVERY_LOG_FILE}"
+FAILED_MARKER="${JOB_PATH}/_FAILED_TRANSCODE"
 mkdir -p "$LOG_DIR"
 
 log() {
@@ -89,26 +90,46 @@ rotate_logs() {
     ) &
 }
 
-cleanup() {
+cleanup_and_finalize() {
+    local status=$?
+    set +e # Allow commands in the trap to fail without exiting immediately
+
+    # On any exit, if a temp file exists and the final file does not, try to recover it.
+    if [ -n "${VIDEO_FILE:-}" ] && [ -f "${TEMP_OUTPUT_FILE:-}" ] && [ ! -f "$FINAL_OUTPUT_FILE" ]; then
+        log_debug "Cleanup: Checking leftover TMP file for promotion."
+        if promote_tmp_if_valid "$VIDEO_FILE" "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE"; then
+            log "Cleanup: TMP auto-promoted to final output."
+            if [ "$VIDEO_FILE" != "$FINAL_OUTPUT_FILE" ]; then
+                 rm "$VIDEO_FILE"
+            fi
+            log_recovery "Auto-promoted TMP on script exit: $FINAL_OUTPUT_FILE"
+            # Since we recovered, ensure notifications are sent.
+            NEEDS_NOTIFICATION=1
+            TRANSCODE_SUCCESS=true
+        else
+            log "Cleanup: TMP was not valid and could not be promoted. Removing."
+            rm -f "$TEMP_OUTPUT_FILE"
+        fi
+    fi
+
+    # Final status logging and notification sending
     if [ "${TRANSCODE_SUCCESS:-false}" = true ]; then
         log "--- SCRIPT END (SUCCESS) ---"
+        if [ "${NEEDS_NOTIFICATION:-0}" -eq 1 ]; then
+            send_notification
+        fi
+        exit 0 # Ensure we exit cleanly after success
+    else
+        # This path is taken if TRANSCODE_SUCCESS was never set to true.
+        log "--- SCRIPT END (FAILURE) ---"
+        log "All transcoding and recovery attempts have failed. See logs for details."
+        log_recovery "Script failed for: ${VIDEO_FILE:-unknown file}. No valid TMP for recovery."
+        # Create a marker so other tools know this job failed.
+        touch "$FAILED_MARKER"
+        exit 1 # Ensure we exit with an error code
     fi
 }
-trap cleanup EXIT
-
-handle_error() {
-    local exit_code=$1
-    local line_no=$2
-    local log_file_path=${MAIN_LOG_FILE:-"/dev/null"}
-    echo "$(date +"%Y-%m-%d %H:%M:%S") | --- SCRIPT ERROR ---" >> "$log_file_path"
-    echo "$(date +"%Y-%m-%d %H:%M:%S") | Error on or near line ${line_no}; exiting with status ${exit_code}." >> "$log_file_path"
-    echo "$(date +"%Y-%m-%d %H:%M:%S") | --- SCRIPT END (FAILURE) ---" >> "$log_file_path"
-    if [ -n "${TEMP_OUTPUT_FILE:-}" ] && [ -f "$TEMP_OUTPUT_FILE" ]; then
-        rm -f "$TEMP_OUTPUT_FILE"
-    fi
-    exit "$exit_code"
-}
-trap 'handle_error $? $LINENO' ERR INT TERM
+trap cleanup_and_finalize EXIT INT TERM
 
 # -------------------- Disk Space Check (Warning Only) -------------------------
 disk_space_warn() {
@@ -462,7 +483,7 @@ send_notification() {
 # ==============================================================================
 
 rotate_logs
-log "--- SCRIPT START (v4.0 Priority + TMP Recovery Patch) ---"
+log "--- SCRIPT START (v4.1 Hardened Recovery) ---"
 log "Job Name: ${JOB_NAME}"
 log "Job Path: ${JOB_PATH}"
 log "Category: ${JOB_CATEGORY}"
@@ -506,6 +527,9 @@ if [ "$NEEDS_TRANSCODE" -eq 1 ]; then
         check_remote_host && REMOTE_HOST_OK=true
     fi
 
+    # This variable will be checked by the cleanup trap on exit.
+    TRANSCODE_SUCCESS=false
+
     for transcoder in $TRANSCODE_PRIORITY; do
         case $transcoder in
             remote_igpu)
@@ -535,26 +559,26 @@ if [ "$NEEDS_TRANSCODE" -eq 1 ]; then
         esac
     done
 
-    # --- Finalize or TMP Recovery ---
+    # --- Finalize ---
+    # The script now relies on the `cleanup_and_finalize` trap to handle all outcomes.
+    # We just need to ensure we exit with the correct status code.
     if [ "${TRANSCODE_SUCCESS:-false}" = true ]; then
-        log "Transcode successful. Finalizing files."
-        mv "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE"
-        if [ "$VIDEO_FILE" != "$FINAL_OUTPUT_FILE" ]; then
-            rm "$VIDEO_FILE"
-        fi
+        log "All transcoders finished. Proceeding to finalization..."
+        # Set variable for notification function, which is now called by the trap
         NEEDS_NOTIFICATION=1
+        exit 0 # Exit successfully, the trap will handle file operations and notifications.
     else
-        log "All transcoding attempts failed. TMP recovery check (if enabled)..."
-        tmp_recovery_check
-        # Don't exit 1: auto-recovery might have set TRANSCODE_SUCCESS.
-        [ "${TRANSCODE_SUCCESS:-false}" = true ] || exit 1
+        log "All transcoding attempts failed. Exiting with error."
+        exit 1 # Exit with failure, the trap will attempt recovery and log the failure.
     fi
 fi
 
+# This handles the case where the file was already compliant and didn't need a transcode.
 if [ "${NEEDS_NOTIFICATION:-0}" -eq 1 ]; then
     send_notification
 fi
 
-# TMP auto-recovery after successful run (safety net)
-tmp_recovery_check
+# The script should have already exited via the logic above, but as a fallback:
+log "Reached end of script unexpectedly. Exiting."
+exit 0
 
