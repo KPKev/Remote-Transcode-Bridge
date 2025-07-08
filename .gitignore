@@ -1,9 +1,34 @@
+# Ignore copied/backup files
+*.conf.bak
+*.sh.bak
+* - Copy.conf
+* - Copy.sh
+*.copy
+COMMIT_EDITMSG
+.history
+.DS_Store
+.idea/
+.vscode/
+
 # Log files
-logs/*.log
+logs/
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
 
-# Progress pipes
-*.pipe
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
 
-# Old script versions
-transcode-v2-working-great-no-progress-is-showing-tho.sh 
+# misc
+.eslintcache
+*.swp
+*~
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local 
