@@ -1,163 +1,228 @@
-# Sabnzbd Post-Processing Script: Priority-Based Transcoding
 
-This is a powerful, single-file post-processing script for Sabnzbd that intelligently transcodes media files into a web-optimized MP4 format (H.264 video, AAC audio). It is designed for maximum flexibility and reliability, featuring a configurable priority system to ensure your media is always processed efficiently.
+# ⚡ Sabnzbd Priority-Based Post-Processing Transcoder
 
-The script can use multiple transcoding engines and will attempt them in the order you specify, providing seamless, automatic fallback if one method fails or is unavailable.
+> **Transcode anything, recover everything, and never lose a Sonarr import again.**
 
-## 🚀 Key Features
+---
 
-- **Configurable Transcoder Priority**: Define the exact order of transcoders to use (e.g., `remote_igpu remote_dgpu local_cpu`).
-- **Multi-Engine Support**:
-    - **Remote Intel iGPU (QSV)**: Offload transcoding to an Intel CPU with Quick Sync Video for fast, efficient hardware encoding.
-    - **Remote NVIDIA dGPU (NVENC)**: Use a dedicated NVIDIA graphics card for the highest-speed hardware encoding.
-    - **Local CPU (libx264)**: A highly compatible software-based fallback that runs directly on the Sabnzbd machine.
-- **Independent Control**: Enable or disable each transcoder individually in the config file.
-- **Automatic Fallback**: If a transcoder fails or is disabled, the script automatically moves to the next one in your priority list.
-- **Unified Live Progress Reporting**: A universal progress reader provides a consistent, real-time progress bar in the Sabnzbd UI for *all* transcoding methods, including remote ones. It shows a live spinner, percentage, speed, and ETA.
-- **Intelligent Analysis**: Uses `ffprobe` to analyze files and only transcodes what is necessary, copying compatible audio streams and skipping files that are already compliant.
-- **Unified & Rotated Logging**: All output from the script and every `ffmpeg` process is captured in a single, timestamped log file for easy debugging. Logs are automatically rotated to save space.
-- **Highly Configurable**: All behavior, from quality settings to server addresses, is controlled via a simple, clean `transcode.conf` file.
-- **Media Server Integration**: Includes placeholders to automatically notify Sonarr, Radarr, and Plex after a successful transcode.
+## ✨ Overview
 
-## 📋 Requirements
+This is a *powerful*, priority-driven, production-grade post-processing script for [Sabnzbd](https://sabnzbd.org/) that automatically converts any supported video into a web-optimized, Plex/Direct-Play–ready MP4 (H.264/AAC).  
+**Supports multiple transcoders, automatic error recovery, and seamless Sonarr/Radarr/Plex integration.**  
+No stranded `.tmp` files, no more import failures—just reliable automation.
 
-### System
-- **Sabnzbd**: For post-processing integration.
-- **FFmpeg & FFprobe**: Must be available in the Sabnzbd container's environment (for local CPU transcoding and media analysis).
-- **SSH Client**: For connecting to remote transcoding machines.
+---
 
-### Remote Transcoder Machine(s)
-- An Intel CPU with QSV support or an NVIDIA GPU with NVENC support.
-- A running SSH server (like OpenSSH on Windows or Linux).
-- A full installation of FFmpeg available in the system's PATH.
-- Correctly configured SSH key-based authentication for passwordless login.
+## 🚀 Features
 
-## 🛠️ Installation
+- **Priority-Based Transcoding:**  
+  Flexible ordering: try iGPU (QSV), dGPU (NVENC), then fallback to local CPU (NAS), or any custom sequence.
+- **Remote GPU Offload:**  
+  Transcode on any Windows/Linux box with Intel or Nvidia GPU using SSH.
+- **Automatic Fallback:**  
+  If one method fails, script retries the next, always ensuring the job completes.
+- **Orphan Recovery:**  
+  If a valid `.tmp.mp4` is left behind (e.g., after a crash), script auto-recovers and promotes it.
+- **Intelligent Validation:**  
+  Ensures recovered files are playable and match the original's duration/codec before import.
+- **Configurable Everything:**  
+  All logic lives in `transcode.conf`. Edit without touching the main script.
+- **Integrated Logging:**  
+  Clean, timestamped, rotated logs for every job—plus an optional detailed recovery log.
+- **Real-Time Progress Bar:**  
+  Unified live spinner/percentage/ETA for all engines.
+- **Notifications:**  
+  Seamless Sonarr, Radarr, Plex, and Tautulli refreshes—now with auto-retry on failures.
+- **One-Step Deployment:**  
+  Drop-in for any SABnzbd install—no dependencies beyond ffmpeg/ssh.
+- **Open Source & Easy to Extend!**
 
-1.  **Place Files**: Copy `transcode-v4-priority.sh` and `transcode.conf` into your Sabnzbd `scripts` directory.
-2.  **Make Executable**:
-    ```bash
-    chmod +x transcode-v4-priority.sh
-    ```
-3.  **Configure**: Meticulously edit `transcode.conf` with your specific settings (SSH details, transcoder priority, etc.).
-4.  **Setup in Sabnzbd**: In Sabnzbd's **Settings > Categories**, assign `transcode-v4-priority.sh` to the categories you want to process.
+---
 
-## 📁 File Structure
+## 📦 Quick Install
 
-All files should be placed in your Sabnzbd `scripts` directory.
+1. **Copy Files**  
+   Place `transcode-v4-priority.sh` and `transcode.conf` in your Sabnzbd `scripts` directory.
+2. **Make Executable**
+   ```bash
+   chmod +x transcode-v4-priority.sh
+   ```
+3. **Configure**  
+   Edit `transcode.conf`—set your transcoder order, enable/disable engines, and fill in SSH, API, and quality options.
+4. **Assign in Sabnzbd**  
+   In *Settings > Categories*, assign `transcode-v4-priority.sh` as the script for desired categories.
+
+---
+
+## 🗂️ File Structure
 
 ```
 /your-sabnzbd-config/scripts/
-├── transcode-v4-priority.sh      # The main, executable script.
-├── transcode.conf                # All user settings go here.
-└── logs/                         # All log files are created here automatically.
+├── transcode-v4-priority.sh   # Main logic script
+├── transcode.conf             # Config file (your settings)
+└── logs/                      # Logs and recovery logs (auto-created)
 ```
 
-## ⚙️ Configuration (`transcode.conf`)
-
-This file controls all aspects of the script.
-
-### Transcoder Priority & Control
-This is the core of the new system.
-
-- `TRANSCODE_PRIORITY`: A space-separated string defining the order to attempt transcoding.
-  - *Example*: `"remote_igpu remote_dgpu local_cpu"`
-- `ENABLE_REMOTE_IGPU`: Set to `"true"` or `"false"` to enable/disable the Intel QSV transcoder.
-- `ENABLE_REMOTE_DGPU`: Set to `"true"` or `"false"` to enable/disable the NVIDIA NVENC transcoder.
-- `ENABLE_LOCAL_CPU`: Set to `"true"` or `"false"` to enable/disable the local CPU transcoder.
-
-### SSH & Remote Settings
-- `SSH_HOST`: The IP address or hostname of your remote transcoding machine.
-- `SSH_PORT`: The SSH port (default: `22`).
-- `SSH_USER`: The username for SSH login.
-- `SSH_KEY`: The absolute path *inside the Sabnzbd container* to the SSH private key.
-
-### Encoding Quality
-- `BITRATE_TARGET` / `BITRATE_MAX`: The average and peak bitrate for the video stream.
-- `RESOLUTION_MAX`: The maximum output resolution (e.g., `1920x1080`). Videos will be downscaled to fit.
-- `QSV_PRESET`: The quality preset for the Intel QSV encoder (e.g., `slow`). Slower presets yield better quality.
-- `NVENC_PRESET`: The quality preset for the NVIDIA NVENC encoder (e.g., `p4`). Lower numbers (`p1-p4`) yield better quality.
-
-### Logging
-- `LOG_KEEP`: The number of old log files to keep during rotation (default: `10`).
-
-### Media Server Integration
-- `SONARR_URL` / `SONARR_API_KEY`: Details for your Sonarr instance.
-- `RADARR_URL` / `RADARR_API_KEY`: Details for your Radarr instance.
-- `PLEX_URL` / `PLEX_TOKEN`: Details for your Plex Media Server.
-- `PLEX_SECTION_ID_TV` / `PLEX_SECTION_ID_MOVIES`: The specific library section IDs in Plex to refresh for TV shows and movies.
-- `TAUTULLI_URL` / `TAUTULLI_API_KEY`: Optional details for your Tautulli instance to trigger a library sync.
-- `NOTIFICATION_DELAY_S`: How many seconds to wait after telling Sonarr/Radarr to import before telling Plex/Tautulli to scan. This prevents a race condition where Plex scans before the file is moved.
-
-## 🔄 How It Works
-
-1.  **Analysis**: The script is triggered by Sabnzbd and finds the largest video file in the completed download. It uses `ffprobe` to check its container, video codec, and audio streams.
-2.  **Decision**: The script determines if transcoding is needed based on the file format.
-3.  **Priority Loop**:
-    - The script iterates through the transcoder names in your `TRANSCODE_PRIORITY` string.
-    - For each transcoder, it checks if it is enabled (e.g., `ENABLE_REMOTE_DGPU="true"`).
-    - For remote transcoders, it first verifies it can connect to the `SSH_HOST`.
-    - It executes the first available and enabled transcoder.
-4.  **Execution & Fallback**:
-    - If the chosen transcoder runs and finishes successfully, the script moves on to finalizing the file. The loop is broken.
-    - If the transcoder fails, the script logs the failure and automatically proceeds to the *next* transcoder in the priority list.
-5.  **Progress Monitoring**: While `ffmpeg` runs (locally or remotely), a universal progress loop reads its status, providing a consistent, real-time status line in the Sabnzbd UI.
-6.  **Finalization & Notification**:
-    - After a successful transcode, the temporary file is renamed and the original is deleted.
-    - The script then notifies the appropriate service (Sonarr for TV, Radarr for movies) to import the new file.
-    - It waits for the configured delay (`NOTIFICATION_DELAY_S`).
-    - Finally, it tells Plex and Tautulli to scan their libraries for the new content.
-7.  **Failure**: If all enabled transcoders in the priority list fail, the script exits and leaves the original file intact.
-
-## 🐛 Troubleshooting
-
-The first step is **always to check the log file**. The unified log in the `logs/` directory contains the script's decisions and the full, detailed output from `ffmpeg`, including any errors.
-
-1.  **A Transcoder Fails**: Look at the `FFMPEG:` lines in the log file. The error message from `ffmpeg` will be there (e.g., "No option name near...", "Cannot load model...", "Permission denied").
-2.  **All Remote Transcoders are Skipped**: Check the "Skipping..." messages in the log.
-    - If it says `(disabled)`, check the `ENABLE_...` flags in `transcode.conf`.
-    - If it says `(host unreachable)`, there is an SSH connection problem. Test your connection manually from inside the Sabnzbd container: `ssh -v -p [PORT] -i [KEY_PATH] [USER]@[HOST]`.
-3.  **Progress Bar Issues**: The progress bar relies on reading `ffmpeg`'s output. If it freezes, the `ffmpeg` process has likely stalled or crashed. Check the log for the last `FFMPEG:` message.
-
 ---
-**Author**: Gemini & KPKev
-**Version**: 4.0 (Priority)
 
-## 📝 Version History
+## ⚙️ Configuration: `transcode.conf`
 
-### v6.0 (Current)
-- Complete rewrite of transcoding logic
-- Fixed execution order and process management
-- Improved remote command stability
-- Enhanced progress monitoring
-- Better error handling and cleanup
+### **Transcoder Priority**
+Define the order as a space-separated string:
+```sh
+TRANSCODE_PRIORITY="remote_igpu remote_dgpu local_cpu"
+ENABLE_REMOTE_IGPU="true"   # Intel QSV on remote
+ENABLE_REMOTE_DGPU="true"   # Nvidia NVENC on remote
+ENABLE_LOCAL_CPU="true"     # Local (NAS) CPU fallback
+```
+> Set individual `ENABLE_...` flags to `"false"` to skip that engine.
 
-## 🤝 Contributing
+### **Remote SSH Setup**
+- `SSH_HOST`: IP/hostname of your GPU desktop (e.g. `"192.168.7.16"`)
+- `SSH_USER`: Username on remote system
+- `SSH_KEY`: Private key path (inside SABnzbd container—e.g. `/config/.ssh/id_rsa`)
+- `SSH_PORT`: (usually `22`)
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
+### **Encoding Settings**
+- `BITRATE_TARGET`, `BITRATE_MAX`, `BITRATE_BUFSIZE`: Tune for your network/TVs
+- `RESOLUTION_MAX`: e.g. `1920x1080` for 1080p output
+- `QSV_PRESET`, `NVENC_PRESET`: e.g. `slow`, `p4` (see script for more)
 
-## 📄 License
+### **Media Server APIs**
+- `SONARR_URL` / `SONARR_API_KEY`
+- `RADARR_URL` / `RADARR_API_KEY`
+- `PLEX_URL` / `PLEX_TOKEN` / `PLEX_SECTION_ID_TV` / `PLEX_SECTION_ID_MOVIES`
+- `TAUTULLI_URL` / `TAUTULLI_API_KEY`
+- `NOTIFICATION_DELAY_S`: Wait after Sonarr/Radarr before Plex scan (default: `30`)
 
-This project is open source. Feel free to modify and distribute according to your needs.
-
-## ⚠️ Disclaimer
-
-This script is designed for personal use with legally obtained media content. Ensure you comply with all applicable laws and licensing requirements in your jurisdiction.
-
-## 🆘 Support
-
-For issues and questions:
-1. Check the troubleshooting section
-2. Review log files for error details
-3. Verify all configuration settings
-4. Test SSH connectivity manually
+### **Recovery & Logging**
+- `ENABLE_TMP_RECOVERY="true"`: Enable auto-recovery of orphan `.tmp.mp4`
+- `RECOVERY_LOG_FILE="recovery.log"`: Track every recovery event
+- `VERBOSE_LOGGING="true"`: See even more details in main log (for debugging)
 
 ---
 
-**Author**: Gemini & KPKev
-**Version**: 6.0 (Robust)  
-**Last Updated**: 2025 
+## 🔐 SSH Key Authentication: Quick Start
+
+1. **Generate SSH Key (on NAS/SAB host):**
+   ```bash
+   ssh-keygen -t ed25519 -C "sab-transcode"
+   ```
+   *(Accept defaults, creates `~/.ssh/id_ed25519`)*
+
+2. **Copy Public Key to Remote:**
+   ```bash
+   ssh-copy-id -i ~/.ssh/id_ed25519.pub user@192.168.7.16
+   ```
+   *(Or manually append the key to `~/.ssh/authorized_keys` on remote)*
+
+3. **Test SSH from NAS/SAB Container:**
+   ```bash
+   ssh -i /config/.ssh/id_ed25519 user@192.168.7.16 "echo success"
+   ```
+   - If you see `success`, it works!
+   - No password prompt should appear.
+
+4. **Set Key Path in Config:**
+   ```sh
+   SSH_KEY="/config/.ssh/id_ed25519"
+   ```
+
+---
+
+## 🔄 How It Works (Step-by-Step)
+
+1. **Script is triggered** by Sabnzbd post-processing.
+2. **Largest video file** is detected, codecs probed.
+3. **Transcode priority loop:**  
+    - Tries engines in order: remote iGPU, then dGPU, then NAS CPU.
+    - Each must be both in priority string and ENABLED.
+    - If remote, SSH is tested for connectivity.
+4. **Transcode runs:**  
+    - Live progress bar in SAB (spinner, percent, ETA).
+    - All stderr/stdout captured for diagnostics.
+5. **Finalization:**
+    - On success: Renames `.tmp.mp4` to `.mp4`, deletes original.
+    - On error: If valid `.tmp.mp4` exists, promotes it automatically (with log entry!).
+    - Validation uses `ffprobe`—file must be playable and duration within 2% of source.
+6. **Notifications:**
+    - Sonarr/Radarr are notified to import (with auto-retry).
+    - After delay, Plex/Tautulli are notified to scan.
+7. **Logs everything:**  
+    - Unified logs in `logs/`, with old logs rotated and recovery events tracked.
+
+---
+
+## 🧰 Troubleshooting & FAQ
+
+### **Q: Script leaves a `.tmp.mp4` and Sonarr won’t import?**
+- **New logic:** Script will now *auto-promote* any valid orphan TMP file next run!
+- If this still happens, check recovery log in `logs/recovery.log`.
+
+### **Q: SSH connection fails or remote transcoder skipped?**
+1. **Test manually:**
+   ```bash
+   ssh -v -i /config/.ssh/id_ed25519 user@192.168.7.16
+   ```
+2. **Common issues:**
+   - Wrong SSH key path or permissions
+   - User not allowed in `sshd_config`
+   - SSH agent or known_hosts issue
+
+3. **Resolution:**
+   - Ensure user is in `Remote Desktop Users` or has permission to run ffmpeg
+   - Check logs for “Skipping remote_xxx (disabled or host unreachable)”
+
+### **Q: How do I check what transcoder is being used?**
+- See `--- Starting Remote dGPU Transcode (NVENC) ---` or similar in the main job log.
+- Task Manager on remote: Intel GPU (iGPU) or NVIDIA GPU (dGPU) usage should spike as expected.
+
+### **Q: Progress bar isn’t updating?**
+- Check logs for last “FFMPEG:” line.
+- Possible ffmpeg crash, stalled pipe, or resource overload.
+
+### **Q: Sonarr/Radarr import fails after transcode?**
+- Confirm `.mp4` exists (not just `.tmp.mp4`).
+- Check that permissions are correct and SAB category matches import rule.
+- Log will show API errors—retry is automatic.
+
+### **Q: Need to force CPU/local-only mode?**
+- In `transcode.conf`:
+   ```sh
+   ENABLE_REMOTE_IGPU="false"
+   ENABLE_REMOTE_DGPU="false"
+   ENABLE_LOCAL_CPU="true"
+   TRANSCODE_PRIORITY="local_cpu"
+   ```
+- Restart SAB and requeue job.
+
+---
+
+## 📊 Monitoring, Dashboard, & Customization
+
+- **All logs** are in `logs/`, rotated, timestamped, and human-readable.
+- **Recovery log**: Tracks every TMP recovery event for forensic/QA.
+- **For real-time dashboards:**  
+  - [Tdarr](https://tdarr.io/) or [Unmanic](https://github.com/Unmanic/Unmanic) offer GUIs for transcode farms.
+  - Or build your own with [Flask](https://flask.palletsprojects.com/) or [Grafana](https://grafana.com/) reading these logs.
+
+---
+
+## 📋 Version & Author
+
+- **Author:** [KPKev](https://github.com/KPKev) & [Gemini] & [OpenAI 4.1 - Robust Recovery]
+- **Version:** 6.1 (Robust Recovery, July 2025)
+- **License:** MIT / Open
+
+---
+
+## 🆘 Still Stuck?
+
+- **Step 1:** Check the `logs/` directory for details.
+- **Step 2:** Verify all config values in `transcode.conf`.
+- **Step 3:** Test SSH from the NAS to the remote box.
+- **Step 4:** Drop an issue or pull request on GitHub, or ping [KPKev](https://github.com/yourprofile).
+
+---
+
+> **Enjoy hands-free, bulletproof transcoding for your entire Plex/Sonarr/Radarr workflow!**

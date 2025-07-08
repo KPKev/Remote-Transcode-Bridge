@@ -2,21 +2,7 @@
 set -eu
 
 # ==============================================================================
-# Sabnzbd Post-Processing Script: Transcode to MP4 (v4.0)
-# ==============================================================================
-#
-# Author: Gemini / KPKev
-# Version: 4.0
-#
-# This script intelligently transcodes video files to a web-optimized MP4
-# format (H.264/AAC) for maximum Direct Play compatibility.
-#
-# It uses a configurable priority system to attempt transcoding using:
-#   1. Remote Intel iGPU (QSV)
-#   2. Remote NVIDIA dGPU (NVENC)
-#   3. Local Synology CPU (libx264)
-#
-# Each method can be enabled or disabled independently in transcode.conf.
+# Sabnzbd Post-Processing Script: Transcode to MP4 (v4.0 + Recovery Patch)
 # ==============================================================================
 
 # --- Tell the system where to find binaries and libraries ---
@@ -26,35 +12,25 @@ export LD_LIBRARY_PATH="$(dirname "$0"):${LD_LIBRARY_PATH:-}"
 # --- Load Configuration ---
 CONFIG_FILE="$(dirname "$0")/transcode.conf"
 if [ -f "$CONFIG_FILE" ]; then
-    # shellcheck source=/dev/null
     . "$CONFIG_FILE"
 fi
 
 # --- Set Defaults for Config Values ---
-# Transcoder Priority & Control
 TRANSCODE_PRIORITY="${TRANSCODE_PRIORITY:-remote_igpu remote_dgpu local_cpu}"
 ENABLE_REMOTE_IGPU="${ENABLE_REMOTE_IGPU:-true}"
 ENABLE_REMOTE_DGPU="${ENABLE_REMOTE_DGPU:-true}"
 ENABLE_LOCAL_CPU="${ENABLE_LOCAL_CPU:-true}"
 QSV_PRESET="${QSV_PRESET:-slow}"
 NVENC_PRESET="${NVENC_PRESET:-p4}"
-
-# SSH & Remote
 SSH_HOST="${SSH_HOST:-}"
 SSH_PORT="${SSH_PORT:-22}"
 SSH_USER="${SSH_USER:-}"
 SSH_KEY="${SSH_KEY:-/config/.ssh/id_rsa}"
-
-# Encoding Targets
 BITRATE_TARGET="${BITRATE_TARGET:-6M}"
 BITRATE_MAX="${BITRATE_MAX:-8M}"
 BITRATE_BUFSIZE="${BITRATE_BUFSIZE:-16M}"
 RESOLUTION_MAX="${RESOLUTION_MAX:-1920x1080}"
-
-# Logging
 LOG_KEEP="${LOG_KEEP:-10}"
-
-# Service Integrations (Sonarr, Radarr, Plex)
 SONARR_URL="${SONARR_URL:-}"
 SONARR_API_KEY="${SONARR_API_KEY:-}"
 RADARR_URL="${RADARR_URL:-}"
@@ -63,34 +39,46 @@ PLEX_URL="${PLEX_URL:-}"
 PLEX_TOKEN="${PLEX_TOKEN:-}"
 PLEX_SECTION_ID_TV="${PLEX_SECTION_ID_TV:-}"
 PLEX_SECTION_ID_MOVIES="${PLEX_SECTION_ID_MOVIES:-}"
-PLEX_SECTION_ID="${PLEX_SECTION_ID:-}" # Legacy, for compatibility
+PLEX_SECTION_ID="${PLEX_SECTION_ID:-}"
 TAUTULLI_URL="${TAUTULLI_URL:-}"
 TAUTULLI_API_KEY="${TAUTULLI_API_KEY:-}"
 NOTIFICATION_DELAY_S="${NOTIFICATION_DELAY_S:-45}"
+
+VERBOSE_LOGGING="${VERBOSE_LOGGING:-false}"
+ENABLE_TMP_RECOVERY="${ENABLE_TMP_RECOVERY:-true}"
+RECOVERY_MAX_DURATION_DIFF_PERCENT="${RECOVERY_MAX_DURATION_DIFF_PERCENT:-2}"
+RECOVERY_MIN_SIZE="${RECOVERY_MIN_SIZE:-104857600}"
+RECOVERY_LOG_FILE="${RECOVERY_LOG_FILE:-recovery.log}"
 
 # --- Sabnzbd Environment Variables ---
 JOB_PATH="$1"
 JOB_NAME="$3"
 JOB_CATEGORY="${5:-}"
 
-# --- Script Setup ---
 SCRIPT_DIR="$(dirname "$0")"
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 LOG_DIR="${SCRIPT_DIR}/logs"
 JOB_NAME_SAFE=$(echo "$JOB_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g' | cut -c 1-50)
 LOG_FILE_BASE="${LOG_DIR}/${TIMESTAMP}_${JOB_NAME_SAFE}"
 MAIN_LOG_FILE="${LOG_FILE_BASE}_main.log"
-NEEDS_TRANSCODE=0
-NEEDS_NOTIFICATION=0
-TRANSCODE_SUCCESS=false
-
-# --- Logging ---
+RECOVERY_LOG_PATH="${LOG_DIR}/${RECOVERY_LOG_FILE}"
 mkdir -p "$LOG_DIR"
+
 log() {
     echo "$(date +'%Y-%m-%d %H:%M:%S') | $1" | tee -a "$MAIN_LOG_FILE"
 }
 
-# --- Log Rotation ---
+log_debug() {
+    if [ "$VERBOSE_LOGGING" = "true" ]; then
+        echo "$(date +'%Y-%m-%d %H:%M:%S') | DEBUG: $1" | tee -a "$MAIN_LOG_FILE"
+    fi
+}
+
+log_recovery() {
+    local msg="$1"
+    echo "$(date +'%Y-%m-%d %H:%M:%S') | $msg" | tee -a "$RECOVERY_LOG_PATH"
+}
+
 rotate_logs() {
     (
         find "$LOG_DIR" -maxdepth 1 -name "*.log" -type f -printf '%T@ %p\n' 2>/dev/null |
@@ -101,27 +89,20 @@ rotate_logs() {
     ) &
 }
 
-# --- Cleanup on Exit ---
 cleanup() {
-    # This trap is primarily for successful exits now.
-    # Errors are handled by the ERR trap.
-    if [ "$TRANSCODE_SUCCESS" = true ]; then
+    if [ "${TRANSCODE_SUCCESS:-false}" = true ]; then
         log "--- SCRIPT END (SUCCESS) ---"
     fi
 }
 trap cleanup EXIT
 
-# --- Robust Error Trapping ---
 handle_error() {
     local exit_code=$1
     local line_no=$2
     local log_file_path=${MAIN_LOG_FILE:-"/dev/null"}
-
     echo "$(date +"%Y-%m-%d %H:%M:%S") | --- SCRIPT ERROR ---" >> "$log_file_path"
     echo "$(date +"%Y-%m-%d %H:%M:%S") | Error on or near line ${line_no}; exiting with status ${exit_code}." >> "$log_file_path"
     echo "$(date +"%Y-%m-%d %H:%M:%S") | --- SCRIPT END (FAILURE) ---" >> "$log_file_path"
-
-    # Clean up temporary file if it exists
     if [ -n "${TEMP_OUTPUT_FILE:-}" ] && [ -f "$TEMP_OUTPUT_FILE" ]; then
         rm -f "$TEMP_OUTPUT_FILE"
     fi
@@ -129,37 +110,91 @@ handle_error() {
 }
 trap 'handle_error $? $LINENO' ERR INT TERM
 
-# --- Shared Progress Reader for All Transcoders ---
-# Reads a combined stream of progress data and log data.
-# Updates a live progress bar and writes logs to the main log file.
+# -------------------- Disk Space Check (Warning Only) -------------------------
+disk_space_warn() {
+    avail=$(df -h "$SCRIPT_DIR" | awk 'NR==2 {print $4}')
+    log_debug "Disk space available: $avail"
+}
+
+# -------------------- File/Duration Validation -------------------------
+get_duration_seconds() {
+    ffprobe -v error -select_streams v:0 -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | awk '{print int($1)}'
+}
+is_mp4_playable_and_valid() {
+    local src="$1"
+    local tmp="$2"
+    local max_diff_percent="${RECOVERY_MAX_DURATION_DIFF_PERCENT:-2}"
+
+    # Must exist and be > min size
+    [ -f "$tmp" ] || return 1
+    [ "$(stat -c %s "$tmp")" -gt "$RECOVERY_MIN_SIZE" ] || return 1
+
+    src_dur=$(get_duration_seconds "$src")
+    tmp_dur=$(get_duration_seconds "$tmp")
+    [ -z "$src_dur" ] && return 1
+    [ -z "$tmp_dur" ] && return 1
+    diff=$(awk -v a="$src_dur" -v b="$tmp_dur" 'BEGIN{print (a>b?a-b:b-a)}')
+    pct=$(awk -v d="$diff" -v s="$src_dur" 'BEGIN{print (d/s)*100}')
+    intpct=$(printf "%.0f" "$pct")
+    if [ "$intpct" -le "$max_diff_percent" ]; then
+        return 0
+    else
+        log_debug "TMP duration ($tmp_dur) differs from source ($src_dur) by $intpct%"
+        return 1
+    fi
+}
+
+promote_tmp_if_valid() {
+    local src="$1"
+    local tmp="$2"
+    local final="$3"
+    if is_mp4_playable_and_valid "$src" "$tmp"; then
+        mv "$tmp" "$final"
+        log "Recovery: Moved $tmp to $final (auto-promoted valid TMP)"
+        log_recovery "Auto-promoted TMP: $final (source: $src)"
+        TRANSCODE_SUCCESS=true
+        return 0
+    else
+        log_debug "Recovery: TMP not valid or playable, not promoted ($tmp)"
+        return 1
+    fi
+}
+
+# -------------------- TMP Recovery Logic -------------------------
+tmp_recovery_check() {
+    [ "$ENABLE_TMP_RECOVERY" = "true" ] || return 0
+    if [ -n "${VIDEO_FILE:-}" ]; then
+        OUTBASE=$(basename "${VIDEO_FILE%.*}")
+        FINAL_OUTPUT_FILE="${JOB_DIR}/${OUTBASE}.mp4"
+        TEMP_OUTPUT_FILE="${JOB_DIR}/${OUTBASE}.tmp.mp4"
+        # If TMP exists but final doesn't, and TMP is valid: promote it.
+        if [ -f "$TEMP_OUTPUT_FILE" ] && [ ! -f "$FINAL_OUTPUT_FILE" ]; then
+            log "TMP Recovery: Checking $TEMP_OUTPUT_FILE for promotion"
+            promote_tmp_if_valid "$VIDEO_FILE" "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE"
+        fi
+    fi
+}
+
+# ------------- Core Script Transcode Runners + Logging ---------------
+
 read_progress_and_log() {
     local ENCODER_LABEL=$1
     local FFMPEG_PID=$2
-
     local spinner="/-\\|"
     local spin_i=0
     local last_percentage=-1
     local current_speed="1"
     local etr_str="--:--"
-
-    # Get duration once.
     TOTAL_DURATION_S=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" | cut -d. -f1)
     [ -z "$TOTAL_DURATION_S" ] && TOTAL_DURATION_S=1
-
-    # Loop until the ffmpeg process is no longer running.
-    # The 'kill -0' check is a robust way to see if a PID exists.
     while kill -0 "$FFMPEG_PID" 2>/dev/null; do
-        # Read from the progress pipe with a timeout.
-        # This prevents the loop from getting stuck if ffmpeg hangs.
         if IFS= read -r -t 5 line; then
-            # Check if the line is progress data (contains '=')
             if echo "$line" | grep -q '='; then
                 key=$(echo "$line" | cut -d'=' -f1)
                 value=$(echo "$line" | cut -d'=' -f2 | tr -d '[:space:]')
                 if [ "$key" = "out_time_us" ]; then
                     current_time_us=$value
                     progress_s=$((current_time_us / 1000000))
-                    # Ensure percentage doesn't exceed 100
                     percent=$(( (progress_s * 100) / (TOTAL_DURATION_S > 0 ? TOTAL_DURATION_S : 1) ))
                     [ $percent -gt 100 ] && percent=100
                     last_percentage=$percent
@@ -168,27 +203,20 @@ read_progress_and_log() {
                     [ -z "$current_speed" ] && current_speed=1
                 fi
             else
-                # This is a log line, so write it to the main log file, prefixed for clarity.
                 echo "$(date +'%Y-%m-%d %H:%M:%S') | FFMPEG: $line" >> "$MAIN_LOG_FILE"
             fi
         fi
-        
-        # Update spinner and ETA regardless of new data, to show it's alive.
         if [ "$current_speed" -gt "0" ] && [ "$TOTAL_DURATION_S" -gt 0 ] && [ "${progress_s:-0}" -gt 0 ]; then
             remaining_s=$(( (TOTAL_DURATION_S - progress_s) / current_speed ))
             etr_str=$(printf "%02d:%02d" $((remaining_s / 60)) $((remaining_s % 60)))
         fi
         spin_i=$(((spin_i + 1) % 4))
         spinner_char=$(echo "$spinner" | cut -c $((spin_i + 1)))
-        
-        # Draw the progress bar.
         printf "\r[%s] %s: %s%% | Speed: %sx | ETA: %s" "$spinner_char" "$ENCODER_LABEL" "$last_percentage" "$current_speed" "$etr_str"
     done
-    
-    echo # Newline after the progress bar is complete.
+    echo
 }
 
-# --- Function to check if remote host is available ---
 check_remote_host() {
     if [ -z "$SSH_HOST" ] || [ -z "$SSH_USER" ]; then
         log "SSH_HOST or SSH_USER not defined in config. Cannot use remote transcoders."
@@ -201,15 +229,12 @@ check_remote_host() {
     return 0
 }
 
-# --- Transcoder: Remote Intel iGPU (QSV) ---
 run_remote_igpu() {
     log "--- Starting Remote iGPU Transcode (QSV) ---"
+    disk_space_warn
     local PROGRESS_PIPE="${LOG_DIR}/ffmpeg_progress_${RANDOM}.pipe"
+    local FFMPEG_STDERR_LOG="${LOG_DIR}/ffmpeg_stderr_${RANDOM}.log"
     mkfifo "$PROGRESS_PIPE"
-
-    # The remote ffmpeg command now sends progress to stderr (pipe:2)
-    # ALL -hwaccel flags have been removed. We let the -c:v h264_qsv encoder
-    # handle the hardware interaction, which is more robust.
     local FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y \
         -progress pipe:2 \
         -i - \
@@ -219,41 +244,37 @@ run_remote_igpu() {
         -b:v ${BITRATE_TARGET} -maxrate:v ${BITRATE_MAX} -bufsize:v ${BITRATE_BUFSIZE} \
         ${AUDIO_PARAMS} \
         -movflags frag_keyframe+empty_moov -f mp4 -"
-
-    # Execute via SSH in the background.
-    # Stderr (2>) from the remote ffmpeg contains combined progress and logs,
-    # which we pipe into our local progress pipe.
     ssh -T -o "ConnectTimeout=15" -o "StrictHostKeyChecking=no" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
-        "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> "$PROGRESS_PIPE" &
-    
+        "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> >(tee "$PROGRESS_PIPE" > "$FFMPEG_STDERR_LOG") &
     local ssh_pid=$!
-
-    # Start the universal progress reader
     log "--- FFMPEG Output for Remote iGPU ---"
     read_progress_and_log "Remote iGPU" "$ssh_pid" < "$PROGRESS_PIPE"
     log "--- End of FFMPEG Output for Remote iGPU ---"
     rm -f "$PROGRESS_PIPE"
-
-    wait $ssh_pid
+    wait $ssh_pid || true
     local ssh_ec=$?
     if [ $ssh_ec -eq 0 ] && [ -s "$TEMP_OUTPUT_FILE" ]; then
         log "Remote iGPU transcode completed successfully."
         return 0
     else
         log "Remote iGPU transcode failed. Exit code: $ssh_ec."
-        # Clean up failed artifact
-        rm -f "$TEMP_OUTPUT_FILE"
+        tail -n 40 "$FFMPEG_STDERR_LOG" | while read -r line; do log_debug "$line"; done
+        if [ -s "$TEMP_OUTPUT_FILE" ]; then
+            log_debug "WARN: .tmp.mp4 output exists and is non-empty. Attempting auto-promote if valid."
+            promote_tmp_if_valid "$VIDEO_FILE" "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE" || rm -f "$TEMP_OUTPUT_FILE"
+        else
+            rm -f "$TEMP_OUTPUT_FILE"
+        fi
         return 1
     fi
 }
 
-# --- Transcoder: Remote NVIDIA dGPU (NVENC) ---
 run_remote_dgpu() {
     log "--- Starting Remote dGPU Transcode (NVENC) ---"
+    disk_space_warn
     local PROGRESS_PIPE="${LOG_DIR}/ffmpeg_progress_${RANDOM}.pipe"
+    local FFMPEG_STDERR_LOG="${LOG_DIR}/ffmpeg_stderr_${RANDOM}.log"
     mkfifo "$PROGRESS_PIPE"
-
-    # The remote ffmpeg command now sends progress to stderr (pipe:2)
     local FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y -i - \
         -progress pipe:2 \
         -map 0:v:0 -map 0:a:0? \
@@ -262,80 +283,97 @@ run_remote_dgpu() {
         -rc:v vbr_hq -b:v ${BITRATE_TARGET} -maxrate:v ${BITRATE_MAX} -bufsize:v ${BITRATE_BUFSIZE} \
         ${AUDIO_PARAMS} \
         -movflags frag_keyframe+empty_moov -f mp4 -"
-
     ssh -T -o "ConnectTimeout=15" -o "StrictHostKeyChecking=no" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
-        "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> "$PROGRESS_PIPE" &
-    
+        "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> >(tee "$PROGRESS_PIPE" > "$FFMPEG_STDERR_LOG") &
     local ssh_pid=$!
-
-    # Start the universal progress reader
     log "--- FFMPEG Output for Remote dGPU ---"
     read_progress_and_log "Remote dGPU" "$ssh_pid" < "$PROGRESS_PIPE"
     log "--- End of FFMPEG Output for Remote dGPU ---"
     rm -f "$PROGRESS_PIPE"
-
-    wait $ssh_pid
+    wait $ssh_pid || true
     local ssh_ec=$?
     if [ $ssh_ec -eq 0 ] && [ -s "$TEMP_OUTPUT_FILE" ]; then
         log "Remote dGPU transcode completed successfully."
         return 0
     else
         log "Remote dGPU transcode failed. Exit code: $ssh_ec."
-        rm -f "$TEMP_OUTPUT_FILE"
+        tail -n 40 "$FFMPEG_STDERR_LOG" | while read -r line; do log_debug "$line"; done
+        if [ -s "$TEMP_OUTPUT_FILE" ]; then
+            log_debug "WARN: .tmp.mp4 output exists and is non-empty. Attempting auto-promote if valid."
+            promote_tmp_if_valid "$VIDEO_FILE" "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE" || rm -f "$TEMP_OUTPUT_FILE"
+        else
+            rm -f "$TEMP_OUTPUT_FILE"
+        fi
         return 1
     fi
 }
 
-# --- Transcoder: Local CPU (libx264) ---
 run_local_cpu() {
     log "--- Starting Local CPU Transcode (libx264) ---"
+    disk_space_warn
     local PROGRESS_PIPE="${LOG_DIR}/ffmpeg_progress_${RANDOM}.pipe"
+    local FFMPEG_STDERR_LOG="${LOG_DIR}/ffmpeg_stderr_${RANDOM}.log"
     mkfifo "$PROGRESS_PIPE"
-
     local SCALE_FILTER="scale=w='min(iw,${RESOLUTION_MAX%x*})':h='min(ih,${RESOLUTION_MAX#*x})':force_original_aspect_ratio=decrease"
-
-    # Run ffmpeg in the background, sending combined output to the progress pipe
     ffmpeg -hide_banner -loglevel error -progress pipe:1 -y \
         -i "$VIDEO_FILE" \
         -map 0:v:0 -map 0:a:0? \
         -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p \
         -vf "$SCALE_FILTER" \
         ${AUDIO_PARAMS} \
-        -movflags frag_keyframe+empty_moov -f mp4 "$TEMP_OUTPUT_FILE" > "$PROGRESS_PIPE" 2>&1 &
-    
+        -movflags frag_keyframe+empty_moov -f mp4 "$TEMP_OUTPUT_FILE" > "$PROGRESS_PIPE" 2>"$FFMPEG_STDERR_LOG" &
     local ffmpeg_pid=$!
-
-    # Use the new universal progress reader
     log "--- FFMPEG Output for Local CPU ---"
     read_progress_and_log "Local CPU" "$ffmpeg_pid" < "$PROGRESS_PIPE"
     log "--- End of FFMPEG Output for Local CPU ---"
     rm -f "$PROGRESS_PIPE"
-
-    wait $ffmpeg_pid
+    wait $ffmpeg_pid || true
     local ffmpeg_ec=$?
     if [ $ffmpeg_ec -eq 0 ] && [ -s "$TEMP_OUTPUT_FILE" ]; then
         log "Local CPU transcode completed successfully."
         return 0
     else
         log "Local CPU transcode failed. Exit code: $ffmpeg_ec."
-        rm -f "$TEMP_OUTPUT_FILE"
+        tail -n 40 "$FFMPEG_STDERR_LOG" | while read -r line; do log_debug "$line"; done
+        if [ -s "$TEMP_OUTPUT_FILE" ]; then
+            log_debug "WARN: .tmp.mp4 output exists and is non-empty. Attempting auto-promote if valid."
+            promote_tmp_if_valid "$VIDEO_FILE" "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE" || rm -f "$TEMP_OUTPUT_FILE"
+        else
+            rm -f "$TEMP_OUTPUT_FILE"
+        fi
         return 1
     fi
 }
 
-# --- Service Notifications ---
+# --- Service Notifications (with retry logic) ---
+
 notify_sonarr() {
     if [ -n "$SONARR_URL" ] && [ -n "$SONARR_API_KEY" ]; then
         log "Notifying Sonarr..."
         DOWNLOAD_ID=$(basename "$JOB_PATH")
-        curl -sL -X POST "${SONARR_URL%/}/api/v3/command" \
+        resp=$(curl -sL -X POST "${SONARR_URL%/}/api/v3/command" \
             -H "X-Api-Key: $SONARR_API_KEY" \
             -d "{
                 \"name\": \"DownloadedEpisodesScan\",
                 \"path\": \"$JOB_PATH\",
                 \"downloadClientId\": \"${DOWNLOAD_ID}\",
                 \"importMode\": \"Move\"
-            }" >/dev/null
+            }")
+        if echo "$resp" | grep -q "error"; then
+            log "Sonarr notification failed, retrying in 30s..."
+            sleep 30
+            resp2=$(curl -sL -X POST "${SONARR_URL%/}/api/v3/command" \
+                -H "X-Api-Key: $SONARR_API_KEY" \
+                -d "{
+                    \"name\": \"DownloadedEpisodesScan\",
+                    \"path\": \"$JOB_PATH\",
+                    \"downloadClientId\": \"${DOWNLOAD_ID}\",
+                    \"importMode\": \"Move\"
+                }")
+            if echo "$resp2" | grep -q "error"; then
+                log "Sonarr notification failed again. Giving up."
+            fi
+        fi
     fi
 }
 
@@ -343,14 +381,29 @@ notify_radarr() {
     if [ -n "$RADARR_URL" ] && [ -n "$RADARR_API_KEY" ]; then
         log "Notifying Radarr..."
         DOWNLOAD_ID=$(basename "$JOB_PATH")
-        curl -sL -X POST "${RADARR_URL%/}/api/v3/command" \
+        resp=$(curl -sL -X POST "${RADARR_URL%/}/api/v3/command" \
             -H "X-Api-Key: $RADARR_API_KEY" \
             -d "{
                 \"name\": \"DownloadedMoviesScan\",
                 \"path\": \"$JOB_PATH\",
                 \"downloadClientId\": \"${DOWNLOAD_ID}\",
                 \"importMode\": \"Move\"
-            }" >/dev/null
+            }")
+        if echo "$resp" | grep -q "error"; then
+            log "Radarr notification failed, retrying in 30s..."
+            sleep 30
+            resp2=$(curl -sL -X POST "${RADARR_URL%/}/api/v3/command" \
+                -H "X-Api-Key: $RADARR_API_KEY" \
+                -d "{
+                    \"name\": \"DownloadedMoviesScan\",
+                    \"path\": \"$JOB_PATH\",
+                    \"downloadClientId\": \"${DOWNLOAD_ID}\",
+                    \"importMode\": \"Move\"
+                }")
+            if echo "$resp2" | grep -q "error"; then
+                log "Radarr notification failed again. Giving up."
+            fi
+        fi
     fi
 }
 
@@ -372,9 +425,6 @@ notify_tautulli() {
 
 send_notification() {
     log "--- Sending Notifications ---"
-    
-    # Sabnzbd can send category as name (movies) or number (1).
-    # This handles both cases.
     case "$JOB_CATEGORY" in
         *movie* | 1)
             log "Category identified as 'Movie'."
@@ -394,12 +444,10 @@ send_notification() {
             ;;
         *)
             log "Unknown category: '${JOB_CATEGORY}'. Cannot send targeted notifications."
-            # Fallback: Try both if keys are present
             notify_radarr
             notify_sonarr
             log "Waiting ${NOTIFICATION_DELAY_S} seconds for files to be moved before notifying Plex/Tautulli..."
             sleep "$NOTIFICATION_DELAY_S"
-            # Fallback for Plex: use the legacy single ID if defined
             if [ -n "$PLEX_SECTION_ID" ]; then
                 notify_plex "$PLEX_SECTION_ID"
                 notify_tautulli "$PLEX_SECTION_ID"
@@ -414,13 +462,12 @@ send_notification() {
 # ==============================================================================
 
 rotate_logs
-log "--- SCRIPT START (v4.0 Priority) ---"
+log "--- SCRIPT START (v4.0 Priority + TMP Recovery Patch) ---"
 log "Job Name: ${JOB_NAME}"
 log "Job Path: ${JOB_PATH}"
 log "Category: ${JOB_CATEGORY}"
 
 VIDEO_FILE=$(find "$JOB_PATH" -type f \( -name "*.mkv" -o -name "*.mp4" -o -name "*.avi" -o -name "*.mov" \) -printf '%s %p\n' | sort -rn | head -n 1 | cut -d' ' -f2-)
-
 if [ -z "$VIDEO_FILE" ]; then
     log "No video file found in '$JOB_PATH'. Nothing to do."
     exit 0
@@ -431,13 +478,12 @@ VIDEO_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_na
 AUDIO_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" 2>/dev/null)
 AUDIO_CHANNELS=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" 2>/dev/null)
 CONTAINER=$(basename "$VIDEO_FILE" | rev | cut -d . -f 1 | rev)
-
 log "Detected format: Container=$CONTAINER, Video=$VIDEO_CODEC, Audio=$AUDIO_CODEC (${AUDIO_CHANNELS}ch)"
 
 if [ "$CONTAINER" = "mp4" ] && [ "$VIDEO_CODEC" = "h264" ] && [ "$AUDIO_CODEC" = "aac" ] && [ "$AUDIO_CHANNELS" -le 2 ]; then
     log "File is already compliant. No transcoding needed."
     NEEDS_TRANSCODE=0
-    NEEDS_NOTIFICATION=1 # Still notify Sonarr/Radarr of the import
+    NEEDS_NOTIFICATION=1
 else
     log "File requires transcoding."
     NEEDS_TRANSCODE=1
@@ -448,8 +494,6 @@ if [ "$NEEDS_TRANSCODE" -eq 1 ]; then
     OUTBASE=$(basename "${VIDEO_FILE%.*}")
     FINAL_OUTPUT_FILE="${JOB_DIR}/${OUTBASE}.mp4"
     TEMP_OUTPUT_FILE="${JOB_DIR}/${OUTBASE}.tmp.mp4"
-
-    # --- Build Audio Command ---
     if [ "$AUDIO_CODEC" = "aac" ] && [ "$AUDIO_CHANNELS" -le 2 ]; then
         log "Audio is AAC with 2 or fewer channels. Stream will be copied."
         AUDIO_PARAMS="-c:a copy"
@@ -457,13 +501,11 @@ if [ "$NEEDS_TRANSCODE" -eq 1 ]; then
         log "Audio is '${AUDIO_CODEC}'. It will be transcoded to AAC stereo."
         AUDIO_PARAMS="-c:a aac -ac 2 -b:a 192k"
     fi
-
     REMOTE_HOST_OK=false
     if echo "$TRANSCODE_PRIORITY" | grep -q "remote"; then
         check_remote_host && REMOTE_HOST_OK=true
     fi
-    
-    # --- Transcoder Priority Loop ---
+
     for transcoder in $TRANSCODE_PRIORITY; do
         case $transcoder in
             remote_igpu)
@@ -493,8 +535,8 @@ if [ "$NEEDS_TRANSCODE" -eq 1 ]; then
         esac
     done
 
-    # --- Finalize ---
-    if [ "$TRANSCODE_SUCCESS" = true ]; then
+    # --- Finalize or TMP Recovery ---
+    if [ "${TRANSCODE_SUCCESS:-false}" = true ]; then
         log "Transcode successful. Finalizing files."
         mv "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE"
         if [ "$VIDEO_FILE" != "$FINAL_OUTPUT_FILE" ]; then
@@ -502,13 +544,17 @@ if [ "$NEEDS_TRANSCODE" -eq 1 ]; then
         fi
         NEEDS_NOTIFICATION=1
     else
-        log "All transcoding attempts failed. Leaving original file intact."
-        # No error trap exit, because failing to transcode is not a script error.
-        # It's a process failure. The script itself ran correctly.
-        exit 1
+        log "All transcoding attempts failed. TMP recovery check (if enabled)..."
+        tmp_recovery_check
+        # Don't exit 1: auto-recovery might have set TRANSCODE_SUCCESS.
+        [ "${TRANSCODE_SUCCESS:-false}" = true ] || exit 1
     fi
 fi
 
-if [ "$NEEDS_NOTIFICATION" -eq 1 ]; then
+if [ "${NEEDS_NOTIFICATION:-0}" -eq 1 ]; then
     send_notification
-fi 
+fi
+
+# TMP auto-recovery after successful run (safety net)
+tmp_recovery_check
+
