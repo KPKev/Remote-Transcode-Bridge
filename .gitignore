@@ -4,6 +4,8 @@
 * - Copy.conf
 * - Copy.sh
 *.copy
+*copy.conf
+*copy.sh
 COMMIT_EDITMSG
 .history
 .DS_Store

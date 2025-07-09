@@ -49,6 +49,8 @@ ENABLE_TMP_RECOVERY="${ENABLE_TMP_RECOVERY:-true}"
 RECOVERY_MAX_DURATION_DIFF_PERCENT="${RECOVERY_MAX_DURATION_DIFF_PERCENT:-2}"
 RECOVERY_MIN_SIZE="${RECOVERY_MIN_SIZE:-104857600}"
 RECOVERY_LOG_FILE="${RECOVERY_LOG_FILE:-recovery.log}"
+GPU_ENCODE_MODE="${GPU_ENCODE_MODE:-cqp}"
+GPU_CQ_LEVEL="${GPU_CQ_LEVEL:-25}"
 
 # --- Sabnzbd Environment Variables ---
 JOB_PATH="$1"
@@ -256,15 +258,31 @@ run_remote_igpu() {
     local PROGRESS_PIPE="${LOG_DIR}/ffmpeg_progress_${RANDOM}.pipe"
     local FFMPEG_STDERR_LOG="${LOG_DIR}/ffmpeg_stderr_${RANDOM}.log"
     mkfifo "$PROGRESS_PIPE"
-    local FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y \
-        -progress pipe:2 \
-        -i - \
-        -map 0:v:0 -map 0:a:0? \
-        -c:v h264_qsv -preset:v ${QSV_PRESET} -profile:v high -level:v 4.0 -pix_fmt yuv420p \
-        -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" \
-        -b:v ${BITRATE_TARGET} -maxrate:v ${BITRATE_MAX} -bufsize:v ${BITRATE_BUFSIZE} \
-        ${AUDIO_PARAMS} \
-        -movflags frag_keyframe+empty_moov -f mp4 -"
+    
+    local FFMPEG_CMD_REMOTE=""
+    if [ "$GPU_ENCODE_MODE" = "cqp" ]; then
+        log_debug "Using CQP (ICQ) mode for iGPU with quality level ${GPU_CQ_LEVEL}"
+        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y \
+            -progress pipe:2 -i - \
+            -map 0:v:0 -map 0:a:0? \
+            -c:v h264_qsv -preset:v ${QSV_PRESET} -profile:v high -level:v 4.1 -pix_fmt yuv420p \
+            -global_quality ${GPU_CQ_LEVEL} \
+            -vf \"scale_qsv=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" \
+            ${AUDIO_PARAMS} \
+            -movflags frag_keyframe+empty_moov -f mp4 -"
+    else
+        log_debug "Using Bitrate mode for iGPU with target ${BITRATE_TARGET}"
+        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y \
+            -progress pipe:2 \
+            -i - \
+            -map 0:v:0 -map 0:a:0? \
+            -c:v h264_qsv -preset:v ${QSV_PRESET} -profile:v high -level:v 4.0 -pix_fmt yuv420p \
+            -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" \
+            -b:v ${BITRATE_TARGET} -maxrate:v ${BITRATE_MAX} -bufsize:v ${BITRATE_BUFSIZE} \
+            ${AUDIO_PARAMS} \
+            -movflags frag_keyframe+empty_moov -f mp4 -"
+    fi
+
     ssh -T -o "ConnectTimeout=15" -o "StrictHostKeyChecking=no" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
         "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> >(tee "$PROGRESS_PIPE" > "$FFMPEG_STDERR_LOG") &
     local ssh_pid=$!
@@ -296,14 +314,30 @@ run_remote_dgpu() {
     local PROGRESS_PIPE="${LOG_DIR}/ffmpeg_progress_${RANDOM}.pipe"
     local FFMPEG_STDERR_LOG="${LOG_DIR}/ffmpeg_stderr_${RANDOM}.log"
     mkfifo "$PROGRESS_PIPE"
-    local FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y -i - \
-        -progress pipe:2 \
-        -map 0:v:0 -map 0:a:0? \
-        -c:v h264_nvenc -preset:v ${NVENC_PRESET} -profile:v high -level:v 4.0 -pix_fmt yuv420p \
-        -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" \
-        -rc:v vbr_hq -b:v ${BITRATE_TARGET} -maxrate:v ${BITRATE_MAX} -bufsize:v ${BITRATE_BUFSIZE} \
-        ${AUDIO_PARAMS} \
-        -movflags frag_keyframe+empty_moov -f mp4 -"
+
+    local FFMPEG_CMD_REMOTE=""
+    if [ "$GPU_ENCODE_MODE" = "cqp" ]; then
+        log_debug "Using CQP mode for dGPU with quality level ${GPU_CQ_LEVEL}"
+        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y -i - \
+            -progress pipe:2 \
+            -map 0:v:0 -map 0:a:0? \
+            -c:v h264_nvenc -preset:v ${NVENC_PRESET} -profile:v high -level:v 4.1 -pix_fmt yuv420p \
+            -rc:v cqp -qp ${GPU_CQ_LEVEL} \
+            -vf \"scale_cuda=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" \
+            ${AUDIO_PARAMS} \
+            -movflags frag_keyframe+empty_moov -f mp4 -"
+    else
+        log_debug "Using Bitrate (VBR) mode for dGPU with target ${BITRATE_TARGET}"
+        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y -i - \
+            -progress pipe:2 \
+            -map 0:v:0 -map 0:a:0? \
+            -c:v h264_nvenc -preset:v ${NVENC_PRESET} -profile:v high -level:v 4.0 -pix_fmt yuv420p \
+            -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" \
+            -rc:v vbr_hq -b:v ${BITRATE_TARGET} -maxrate:v ${BITRATE_MAX} -bufsize:v ${BITRATE_BUFSIZE} \
+            ${AUDIO_PARAMS} \
+            -movflags frag_keyframe+empty_moov -f mp4 -"
+    fi
+
     ssh -T -o "ConnectTimeout=15" -o "StrictHostKeyChecking=no" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
         "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> >(tee "$PROGRESS_PIPE" > "$FFMPEG_STDERR_LOG") &
     local ssh_pid=$!
@@ -339,7 +373,7 @@ run_local_cpu() {
     ffmpeg -hide_banner -loglevel error -progress pipe:1 -y \
         -i "$VIDEO_FILE" \
         -map 0:v:0 -map 0:a:0? \
-        -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p \
+        -c:v libx264 -preset slow -crf 23 -pix_fmt yuv420p \
         -vf "$SCALE_FILTER" \
         ${AUDIO_PARAMS} \
         -movflags frag_keyframe+empty_moov -f mp4 "$TEMP_OUTPUT_FILE" > "$PROGRESS_PIPE" 2>"$FFMPEG_STDERR_LOG" &
