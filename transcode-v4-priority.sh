@@ -255,8 +255,9 @@ check_remote_host() {
 run_remote_igpu() {
     log "--- Starting Remote iGPU Transcode (QSV) ---"
     disk_space_warn
-    local PROGRESS_PIPE="${LOG_DIR}/ffmpeg_progress_${RANDOM}.pipe"
-    local FFMPEG_STDERR_LOG="${LOG_DIR}/ffmpeg_stderr_${RANDOM}.log"
+    local LOG_SUFFIX="igpu"
+    local PROGRESS_PIPE="${LOG_FILE_BASE}_${LOG_SUFFIX}_progress.pipe"
+    local FFMPEG_STDERR_LOG="${LOG_FILE_BASE}_${LOG_SUFFIX}_stderr.log"
     mkfifo "$PROGRESS_PIPE"
     
     local FFMPEG_CMD_REMOTE=""
@@ -267,7 +268,7 @@ run_remote_igpu() {
             -map 0:v:0 -map 0:a:0? \
             -c:v h264_qsv -preset:v ${QSV_PRESET} -profile:v high -level:v 4.1 -pix_fmt yuv420p \
             -global_quality ${GPU_CQ_LEVEL} \
-            -vf \"scale_qsv=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" \
+            -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" \
             ${AUDIO_PARAMS} \
             -movflags frag_keyframe+empty_moov -f mp4 -"
     else
@@ -289,15 +290,23 @@ run_remote_igpu() {
     log "--- FFMPEG Output for Remote iGPU ---"
     read_progress_and_log "Remote iGPU" "$ssh_pid" < "$PROGRESS_PIPE"
     log "--- End of FFMPEG Output for Remote iGPU ---"
-    rm -f "$PROGRESS_PIPE"
+    
     wait $ssh_pid || true
     local ssh_ec=$?
+    rm -f "$PROGRESS_PIPE"
+
     if [ $ssh_ec -eq 0 ] && [ -s "$TEMP_OUTPUT_FILE" ]; then
         log "Remote iGPU transcode completed successfully."
+        rm -f "$FFMPEG_STDERR_LOG"
         return 0
     else
         log "Remote iGPU transcode failed. Exit code: $ssh_ec."
-        tail -n 40 "$FFMPEG_STDERR_LOG" | while read -r line; do log_debug "$line"; done
+        if [ -f "$FFMPEG_STDERR_LOG" ]; then
+            log "--- FFMPEG Stderr Dump (iGPU) ---"
+            cat "$FFMPEG_STDERR_LOG" >> "$MAIN_LOG_FILE"
+            log "--- End of Stderr Dump ---"
+            rm -f "$FFMPEG_STDERR_LOG"
+        fi
         if [ -s "$TEMP_OUTPUT_FILE" ]; then
             log_debug "WARN: .tmp.mp4 output exists and is non-empty. Attempting auto-promote if valid."
             promote_tmp_if_valid "$VIDEO_FILE" "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE" || rm -f "$TEMP_OUTPUT_FILE"
@@ -311,8 +320,9 @@ run_remote_igpu() {
 run_remote_dgpu() {
     log "--- Starting Remote dGPU Transcode (NVENC) ---"
     disk_space_warn
-    local PROGRESS_PIPE="${LOG_DIR}/ffmpeg_progress_${RANDOM}.pipe"
-    local FFMPEG_STDERR_LOG="${LOG_DIR}/ffmpeg_stderr_${RANDOM}.log"
+    local LOG_SUFFIX="dgpu"
+    local PROGRESS_PIPE="${LOG_FILE_BASE}_${LOG_SUFFIX}_progress.pipe"
+    local FFMPEG_STDERR_LOG="${LOG_FILE_BASE}_${LOG_SUFFIX}_stderr.log"
     mkfifo "$PROGRESS_PIPE"
 
     local FFMPEG_CMD_REMOTE=""
@@ -322,8 +332,8 @@ run_remote_dgpu() {
             -progress pipe:2 \
             -map 0:v:0 -map 0:a:0? \
             -c:v h264_nvenc -preset:v ${NVENC_PRESET} -profile:v high -level:v 4.1 -pix_fmt yuv420p \
-            -rc:v cqp -qp ${GPU_CQ_LEVEL} \
-            -vf \"scale_cuda=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" \
+            -rc:v constqp -qp ${GPU_CQ_LEVEL} \
+            -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" \
             ${AUDIO_PARAMS} \
             -movflags frag_keyframe+empty_moov -f mp4 -"
     else
@@ -344,15 +354,23 @@ run_remote_dgpu() {
     log "--- FFMPEG Output for Remote dGPU ---"
     read_progress_and_log "Remote dGPU" "$ssh_pid" < "$PROGRESS_PIPE"
     log "--- End of FFMPEG Output for Remote dGPU ---"
-    rm -f "$PROGRESS_PIPE"
+
     wait $ssh_pid || true
     local ssh_ec=$?
+    rm -f "$PROGRESS_PIPE"
+
     if [ $ssh_ec -eq 0 ] && [ -s "$TEMP_OUTPUT_FILE" ]; then
         log "Remote dGPU transcode completed successfully."
+        rm -f "$FFMPEG_STDERR_LOG"
         return 0
     else
         log "Remote dGPU transcode failed. Exit code: $ssh_ec."
-        tail -n 40 "$FFMPEG_STDERR_LOG" | while read -r line; do log_debug "$line"; done
+        if [ -f "$FFMPEG_STDERR_LOG" ]; then
+            log "--- FFMPEG Stderr Dump (dGPU) ---"
+            cat "$FFMPEG_STDERR_LOG" >> "$MAIN_LOG_FILE"
+            log "--- End of Stderr Dump ---"
+            rm -f "$FFMPEG_STDERR_LOG"
+        fi
         if [ -s "$TEMP_OUTPUT_FILE" ]; then
             log_debug "WARN: .tmp.mp4 output exists and is non-empty. Attempting auto-promote if valid."
             promote_tmp_if_valid "$VIDEO_FILE" "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE" || rm -f "$TEMP_OUTPUT_FILE"
@@ -366,8 +384,9 @@ run_remote_dgpu() {
 run_local_cpu() {
     log "--- Starting Local CPU Transcode (libx264) ---"
     disk_space_warn
-    local PROGRESS_PIPE="${LOG_DIR}/ffmpeg_progress_${RANDOM}.pipe"
-    local FFMPEG_STDERR_LOG="${LOG_DIR}/ffmpeg_stderr_${RANDOM}.log"
+    local LOG_SUFFIX="cpu"
+    local PROGRESS_PIPE="${LOG_FILE_BASE}_${LOG_SUFFIX}_progress.pipe"
+    local FFMPEG_STDERR_LOG="${LOG_FILE_BASE}_${LOG_SUFFIX}_stderr.log"
     mkfifo "$PROGRESS_PIPE"
     local SCALE_FILTER="scale=w='min(iw,${RESOLUTION_MAX%x*})':h='min(ih,${RESOLUTION_MAX#*x})':force_original_aspect_ratio=decrease"
     ffmpeg -hide_banner -loglevel error -progress pipe:1 -y \
@@ -381,15 +400,23 @@ run_local_cpu() {
     log "--- FFMPEG Output for Local CPU ---"
     read_progress_and_log "Local CPU" "$ffmpeg_pid" < "$PROGRESS_PIPE"
     log "--- End of FFMPEG Output for Local CPU ---"
-    rm -f "$PROGRESS_PIPE"
+    
     wait $ffmpeg_pid || true
     local ffmpeg_ec=$?
+    rm -f "$PROGRESS_PIPE"
+
     if [ $ffmpeg_ec -eq 0 ] && [ -s "$TEMP_OUTPUT_FILE" ]; then
         log "Local CPU transcode completed successfully."
+        rm -f "$FFMPEG_STDERR_LOG"
         return 0
     else
         log "Local CPU transcode failed. Exit code: $ffmpeg_ec."
-        tail -n 40 "$FFMPEG_STDERR_LOG" | while read -r line; do log_debug "$line"; done
+        if [ -f "$FFMPEG_STDERR_LOG" ]; then
+            log "--- FFMPEG Stderr Dump (CPU) ---"
+            cat "$FFMPEG_STDERR_LOG" >> "$MAIN_LOG_FILE"
+            log "--- End of Stderr Dump ---"
+            rm -f "$FFMPEG_STDERR_LOG"
+        fi
         if [ -s "$TEMP_OUTPUT_FILE" ]; then
             log_debug "WARN: .tmp.mp4 output exists and is non-empty. Attempting auto-promote if valid."
             promote_tmp_if_valid "$VIDEO_FILE" "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE" || rm -f "$TEMP_OUTPUT_FILE"
