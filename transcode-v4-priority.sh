@@ -133,6 +133,24 @@ cleanup_and_finalize() {
 }
 trap cleanup_and_finalize EXIT INT TERM
 
+# --- Utility Functions ---
+
+kill_stalled_processes() {
+    log "Checking for stalled FFmpeg processes..."
+    local stalled_pids=$(ps aux | grep ffmpeg | grep -v grep | awk '{print $2}')
+    if [ -n "$stalled_pids" ]; then
+        log "Found potentially stalled FFmpeg processes: $stalled_pids"
+        echo "$stalled_pids" | xargs -r kill -TERM 2>/dev/null || true
+        sleep 3
+        echo "$stalled_pids" | xargs -r kill -KILL 2>/dev/null || true
+        log "Killed stalled processes."
+    else
+        log "No stalled FFmpeg processes found."
+    fi
+}
+
+# --- Progress Monitoring ---
+
 # -------------------- Disk Space Check (Warning Only) -------------------------
 disk_space_warn() {
     avail=$(df -h "$SCRIPT_DIR" | awk 'NR==2 {print $4}')
@@ -208,8 +226,14 @@ read_progress_and_log() {
     local last_percentage=-1
     local current_speed="1"
     local etr_str="--:--"
+    local last_frame=0
+    local current_frame=0
+    local stall_count=0
+    local max_stall_cycles=24  # 24 * 5 seconds = 2 minutes of no progress before timeout
+    
     TOTAL_DURATION_S=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" | cut -d. -f1)
     [ -z "$TOTAL_DURATION_S" ] && TOTAL_DURATION_S=1
+    
     while kill -0 "$FFMPEG_PID" 2>/dev/null; do
         if IFS= read -r -t 5 line; then
             if echo "$line" | grep -q '='; then
@@ -224,18 +248,37 @@ read_progress_and_log() {
                 elif [ "$key" = "speed" ]; then
                     current_speed=$(echo "$value" | sed 's/x//' | cut -d. -f1)
                     [ -z "$current_speed" ] && current_speed=1
+                elif [ "$key" = "frame" ]; then
+                    current_frame=$value
                 fi
             else
                 echo "$(date +'%Y-%m-%d %H:%M:%S') | FFMPEG: $line" >> "$MAIN_LOG_FILE"
             fi
+            # Reset stall counter when we get valid progress data
+            stall_count=0
+        else
+            # No data received within timeout, check for stall
+            stall_count=$((stall_count + 1))
+            if [ "$current_frame" -eq "$last_frame" ] && [ "$stall_count" -gt "$max_stall_cycles" ]; then
+                echo
+                log "ERROR: FFmpeg appears to be stalled (no progress for 2+ minutes). Killing process..."
+                kill -TERM "$FFMPEG_PID" 2>/dev/null || true
+                sleep 3
+                kill -KILL "$FFMPEG_PID" 2>/dev/null || true
+                return 1
+            fi
         fi
+        
+        # Update last frame for stall detection
+        last_frame=$current_frame
+        
         if [ "$current_speed" -gt "0" ] && [ "$TOTAL_DURATION_S" -gt 0 ] && [ "${progress_s:-0}" -gt 0 ]; then
             remaining_s=$(( (TOTAL_DURATION_S - progress_s) / current_speed ))
             etr_str=$(printf "%02d:%02d" $((remaining_s / 60)) $((remaining_s % 60)))
         fi
         spin_i=$(((spin_i + 1) % 4))
         spinner_char=$(echo "$spinner" | cut -c $((spin_i + 1)))
-        printf "\r[%s] %s: %s%% | Speed: %sx | ETA: %s" "$spinner_char" "$ENCODER_LABEL" "$last_percentage" "$current_speed" "$etr_str"
+        printf "\r[%s] %s: %s%% | Speed: %sx | ETA: %s | Frame: %s" "$spinner_char" "$ENCODER_LABEL" "$last_percentage" "$current_speed" "$etr_str" "$current_frame"
     done
     echo
 }
@@ -284,7 +327,7 @@ run_remote_igpu() {
             -movflags frag_keyframe+empty_moov -f mp4 -"
     fi
 
-    ssh -T -o "ConnectTimeout=15" -o "StrictHostKeyChecking=no" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
+    ssh -T -o "ConnectTimeout=15" -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "StrictHostKeyChecking=no" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
         "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> >(tee "$PROGRESS_PIPE" > "$FFMPEG_STDERR_LOG") &
     local ssh_pid=$!
     log "--- FFMPEG Output for Remote iGPU ---"
@@ -348,7 +391,7 @@ run_remote_dgpu() {
             -movflags frag_keyframe+empty_moov -f mp4 -"
     fi
 
-    ssh -T -o "ConnectTimeout=15" -o "StrictHostKeyChecking=no" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
+    ssh -T -o "ConnectTimeout=15" -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "StrictHostKeyChecking=no" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
         "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> >(tee "$PROGRESS_PIPE" > "$FFMPEG_STDERR_LOG") &
     local ssh_pid=$!
     log "--- FFMPEG Output for Remote dGPU ---"
@@ -546,7 +589,7 @@ send_notification() {
 # ==============================================================================
 
 rotate_logs
-log "--- SCRIPT START (v4.1 Hardened Recovery) ---"
+log "--- SCRIPT START (v4.2 Anti-Hang Protection) ---"
 log "Job Name: ${JOB_NAME}"
 log "Job Path: ${JOB_PATH}"
 log "Category: ${JOB_CATEGORY}"

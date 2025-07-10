@@ -31,6 +31,8 @@ No stranded `.tmp` files, no more import failures—just reliable automation.
   Clean, timestamped, rotated logs for every job—plus an optional detailed recovery log.
 - **Real-Time Progress Bar:**  
   Unified live spinner/percentage/ETA for all engines.
+- **Anti-Hang Protection:**  
+  Automatic stall detection and process termination prevents infinite hangs.
 - **Notifications:**  
   Seamless Sonarr, Radarr, Plex, and Tautulli refreshes—now with auto-retry on failures.
 - **One-Step Deployment:**  
@@ -180,6 +182,9 @@ ENABLE_LOCAL_CPU="true"     # Local (NAS) CPU fallback
 ### **Q: Progress bar isn’t updating?**
 - Check logs for last “FFMPEG:” line.
 - Possible ffmpeg crash, stalled pipe, or resource overload.
+- **v4.2 Anti-Hang:** Script now detects stalls and kills hung processes automatically after 2 minutes of no progress.
+- Check logs for "ERROR: FFmpeg appears to be stalled" message.
+- Common causes: Network issues, SSH connection drops, GPU driver problems.
 
 ### **Q: Sonarr/Radarr import fails after transcode?**
 - Confirm `.mp4` exists (not just `.tmp.mp4`).
@@ -211,7 +216,7 @@ ENABLE_LOCAL_CPU="true"     # Local (NAS) CPU fallback
 ## 📋 Version & Author
 
 - **Author:** [KPKev](https://github.com/KPKev) & [Gemini] & [OpenAI 4.1 - Robust Recovery]
-- **Version:** 6.1 (Robust Recovery, July 2025)
+- **Version:** 4.2 (Anti-Hang Protection, July 2025)
 - **License:** MIT / Open
 
 ---
