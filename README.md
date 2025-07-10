@@ -182,7 +182,8 @@ ENABLE_LOCAL_CPU="true"     # Local (NAS) CPU fallback
 ### **Q: Progress bar isn’t updating?**
 - Check logs for last “FFMPEG:” line.
 - Possible ffmpeg crash, stalled pipe, or resource overload.
-- **v4.2 Anti-Hang:** Script now detects stalls and kills hung processes automatically after 2 minutes of no progress.
+- **v4.3 Enhanced Stall Detection:** Script now tracks actual progress advancement (time/frames) and kills hung processes after 2 minutes of no progress.
+- Added timeout wrapper (2 hours max) and improved SSH connection handling.
 - Check logs for "ERROR: FFmpeg appears to be stalled" message.
 - Common causes: Network issues, SSH connection drops, GPU driver problems.
 
@@ -216,7 +217,7 @@ ENABLE_LOCAL_CPU="true"     # Local (NAS) CPU fallback
 ## 📋 Version & Author
 
 - **Author:** [KPKev](https://github.com/KPKev) & [Gemini] & [OpenAI 4.1 - Robust Recovery]
-- **Version:** 4.2 (Anti-Hang Protection, July 2025)
+- **Version:** 4.3 (Enhanced Stall Detection, July 2025)
 - **License:** MIT / Open
 
 ---
