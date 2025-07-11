@@ -133,6 +133,88 @@ cleanup_and_finalize() {
 }
 trap cleanup_and_finalize EXIT INT TERM
 
+# --- Enhanced Debugging and Logging ---
+
+debug_log() {
+    if [ "${DEBUG_MODE:-false}" = "true" ]; then
+        echo "$(date +'%Y-%m-%d %H:%M:%S') | DEBUG: $*" >> "$MAIN_LOG_FILE"
+        echo "$(date +'%Y-%m-%d %H:%M:%S') | DEBUG: $*" >&2
+    fi
+}
+
+network_diagnostics() {
+    local host="$1"
+    local port="$2"
+    debug_log "=== Network Diagnostics for $host:$port ==="
+    
+    # Test basic connectivity
+    if ping -c 3 "$host" >/dev/null 2>&1; then
+        debug_log "PING: $host is reachable"
+    else
+        debug_log "PING: $host is NOT reachable"
+    fi
+    
+    # Test SSH port connectivity
+    if timeout 10 bash -c "cat < /dev/null > /dev/tcp/$host/$port" 2>/dev/null; then
+        debug_log "TCP: Port $port on $host is open"
+    else
+        debug_log "TCP: Port $port on $host is NOT accessible"
+    fi
+    
+    # Test SSH authentication
+    if timeout 10 ssh -q -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p "$port" -i "$SSH_KEY" "$SSH_USER@$host" "echo 'SSH_AUTH_OK'" 2>/dev/null | grep -q "SSH_AUTH_OK"; then
+        debug_log "SSH: Authentication successful"
+    else
+        debug_log "SSH: Authentication failed or timeout"
+    fi
+    
+    # Get remote system info
+    debug_log "=== Remote System Info ==="
+    ssh -q -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p "$port" -i "$SSH_KEY" "$SSH_USER@$host" "
+        echo 'UPTIME:' \$(uptime)
+        echo 'MEMORY:' \$(free -h | grep Mem)
+        echo 'LOAD:' \$(cat /proc/loadavg)
+        echo 'GPU_PROCESSES:' \$(ps aux | grep ffmpeg | wc -l)
+        echo 'DISK_SPACE:' \$(df -h / | tail -1)
+        echo 'NVIDIA_SMI:' \$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || echo 'N/A')
+    " 2>/dev/null | while IFS= read -r line; do
+        debug_log "REMOTE: $line"
+    done
+}
+
+monitor_ssh_connection() {
+    local ssh_pid="$1"
+    local label="$2"
+    local start_time=$(date +%s)
+    
+    debug_log "=== SSH Connection Monitor Started for $label (PID: $ssh_pid) ==="
+    
+    while kill -0 "$ssh_pid" 2>/dev/null; do
+        local current_time=$(date +%s)
+        local elapsed=$((current_time - start_time))
+        
+        # Log connection status every 30 seconds
+        if [ $((elapsed % 30)) -eq 0 ] && [ $elapsed -gt 0 ]; then
+            debug_log "SSH_MONITOR: $label connection active for ${elapsed}s (PID: $ssh_pid)"
+            
+            # Check if process is actually doing work
+            local cpu_usage=$(ps -p "$ssh_pid" -o pcpu= 2>/dev/null | tr -d ' ')
+            local mem_usage=$(ps -p "$ssh_pid" -o pmem= 2>/dev/null | tr -d ' ')
+            debug_log "SSH_MONITOR: CPU: ${cpu_usage}%, MEM: ${mem_usage}%"
+            
+            # Check network connections
+            local connections=$(netstat -an 2>/dev/null | grep ":$SSH_PORT" | grep ESTABLISHED | wc -l)
+            debug_log "SSH_MONITOR: Active SSH connections: $connections"
+        fi
+        
+        sleep 5
+    done
+    
+    local end_time=$(date +%s)
+    local total_time=$((end_time - start_time))
+    debug_log "=== SSH Connection Monitor Ended for $label (Total time: ${total_time}s) ==="
+}
+
 # --- Utility Functions ---
 
 kill_stalled_processes() {
@@ -148,8 +230,6 @@ kill_stalled_processes() {
         log "No stalled FFmpeg processes found."
     fi
 }
-
-# --- Progress Monitoring ---
 
 # -------------------- Disk Space Check (Warning Only) -------------------------
 disk_space_warn() {
@@ -233,15 +313,23 @@ read_progress_and_log() {
     local last_progress_time=$(date +%s)
     local current_time_us=0
     local last_time_us=0
+    local progress_updates=0
+    local last_bitrate="0"
+    local connection_issues=0
     
     TOTAL_DURATION_S=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" | cut -d. -f1)
     [ -z "$TOTAL_DURATION_S" ] && TOTAL_DURATION_S=1
+    
+    debug_log "=== Progress Monitoring Started for $ENCODER_LABEL (PID: $FFMPEG_PID) ==="
+    debug_log "PROGRESS_INIT: Total duration: ${TOTAL_DURATION_S}s, File: $(basename "$VIDEO_FILE")"
     
     while kill -0 "$FFMPEG_PID" 2>/dev/null; do
         if IFS= read -r -t 5 line; then
             if echo "$line" | grep -q '='; then
                 key=$(echo "$line" | cut -d'=' -f1)
                 value=$(echo "$line" | cut -d'=' -f2 | tr -d '[:space:]')
+                progress_updates=$((progress_updates + 1))
+                
                 if [ "$key" = "out_time_us" ]; then
                     current_time_us=$value
                     progress_s=$((current_time_us / 1000000))
@@ -253,6 +341,7 @@ read_progress_and_log() {
                         last_progress_time=$(date +%s)
                         last_time_us=$current_time_us
                         stall_count=0
+                        debug_log "PROGRESS_ADVANCE: Time ${progress_s}s/${TOTAL_DURATION_S}s (${percent}%)"
                     fi
                 elif [ "$key" = "speed" ]; then
                     current_speed=$(echo "$value" | sed 's/x//' | cut -d. -f1)
@@ -264,19 +353,32 @@ read_progress_and_log() {
                         last_progress_time=$(date +%s)
                         last_frame=$current_frame
                         stall_count=0
+                        debug_log "PROGRESS_ADVANCE: Frame ${current_frame} (Speed: ${current_speed}x)"
                     fi
+                elif [ "$key" = "bitrate" ]; then
+                    last_bitrate=$value
+                fi
+                
+                # Log detailed progress every 100 updates
+                if [ $((progress_updates % 100)) -eq 0 ]; then
+                    debug_log "PROGRESS_STATUS: Updates: $progress_updates, Frame: $current_frame, Time: ${progress_s}s, Speed: ${current_speed}x, Bitrate: $last_bitrate"
                 fi
             else
                 echo "$(date +'%Y-%m-%d %H:%M:%S') | FFMPEG: $line" >> "$MAIN_LOG_FILE"
+                debug_log "FFMPEG_OUTPUT: $line"
             fi
         else
             # No data received within timeout, check for stall
             local current_epoch=$(date +%s)
             local time_since_progress=$((current_epoch - last_progress_time))
+            connection_issues=$((connection_issues + 1))
+            
+            debug_log "PROGRESS_TIMEOUT: No data for 5s (cycle $stall_count, connection issues: $connection_issues, time since progress: ${time_since_progress}s)"
             
             if [ "$time_since_progress" -gt 120 ]; then  # 2 minutes
                 echo
                 log "ERROR: FFmpeg appears to be stalled (no progress for ${time_since_progress}s). Killing process..."
+                debug_log "STALL_DETECTED: Progress updates: $progress_updates, Last frame: $last_frame, Last time: ${progress_s}s"
                 kill -TERM "$FFMPEG_PID" 2>/dev/null || true
                 sleep 3
                 kill -KILL "$FFMPEG_PID" 2>/dev/null || true
@@ -287,6 +389,7 @@ read_progress_and_log() {
             if [ "$stall_count" -gt "$max_stall_cycles" ]; then
                 echo
                 log "ERROR: FFmpeg timeout - no data received for ${stall_count} cycles. Killing process..."
+                debug_log "TIMEOUT_DETECTED: Connection issues: $connection_issues, Progress updates: $progress_updates"
                 kill -TERM "$FFMPEG_PID" 2>/dev/null || true
                 sleep 3
                 kill -KILL "$FFMPEG_PID" 2>/dev/null || true
@@ -303,6 +406,9 @@ read_progress_and_log() {
         printf "\r[%s] %s: %s%% | Speed: %sx | ETA: %s | Frame: %s" "$spinner_char" "$ENCODER_LABEL" "$last_percentage" "$current_speed" "$etr_str" "$current_frame"
     done
     echo
+    
+    debug_log "=== Progress Monitoring Ended for $ENCODER_LABEL ==="
+    debug_log "PROGRESS_SUMMARY: Total updates: $progress_updates, Connection issues: $connection_issues, Final frame: $current_frame, Final time: ${progress_s}s"
 }
 
 check_remote_host() {
@@ -320,6 +426,12 @@ check_remote_host() {
 run_remote_igpu() {
     log "--- Starting Remote iGPU Transcode (QSV) ---"
     disk_space_warn
+    
+    # Run network diagnostics if debug mode is enabled
+    if [ "${DEBUG_MODE:-false}" = "true" ]; then
+        network_diagnostics "$SSH_HOST" "$SSH_PORT"
+    fi
+    
     local LOG_SUFFIX="igpu"
     local PROGRESS_PIPE="${LOG_FILE_BASE}_${LOG_SUFFIX}_progress.pipe"
     local FFMPEG_STDERR_LOG="${LOG_FILE_BASE}_${LOG_SUFFIX}_stderr.log"
@@ -349,15 +461,31 @@ run_remote_igpu() {
             -movflags frag_keyframe+empty_moov -f mp4 -"
     fi
 
+    debug_log "REMOTE_CMD: $FFMPEG_CMD_REMOTE"
     timeout 7200 ssh -T -o "ConnectTimeout=15" -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "StrictHostKeyChecking=no" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
         "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> >(tee "$PROGRESS_PIPE" > "$FFMPEG_STDERR_LOG") &
     local ssh_pid=$!
+    debug_log "SSH_STARTED: PID $ssh_pid for iGPU transcode"
+    
+    # Start SSH connection monitoring in background if debug mode is enabled
+    if [ "${DEBUG_MODE:-false}" = "true" ]; then
+        monitor_ssh_connection "$ssh_pid" "iGPU" &
+        local monitor_pid=$!
+        debug_log "SSH_MONITOR: Started monitor PID $monitor_pid"
+    fi
+    
     log "--- FFMPEG Output for Remote iGPU ---"
     if ! read_progress_and_log "Remote iGPU" "$ssh_pid" < "$PROGRESS_PIPE"; then
         log "Progress monitoring detected stall, killing SSH connection..."
+        debug_log "SSH_KILL: Terminating SSH PID $ssh_pid due to stall"
         kill -TERM "$ssh_pid" 2>/dev/null || true
         sleep 2
         kill -KILL "$ssh_pid" 2>/dev/null || true
+    fi
+    
+    # Kill the monitor process if it's running
+    if [ "${DEBUG_MODE:-false}" = "true" ] && [ -n "${monitor_pid:-}" ]; then
+        kill "$monitor_pid" 2>/dev/null || true
     fi
     log "--- End of FFMPEG Output for Remote iGPU ---"
     
@@ -621,10 +749,16 @@ send_notification() {
 # ==============================================================================
 
 rotate_logs
-log "--- SCRIPT START (v4.3 Enhanced Stall Detection) ---"
+log "--- SCRIPT START (v4.4 Comprehensive Debugging) ---"
 log "Job Name: ${JOB_NAME}"
 log "Job Path: ${JOB_PATH}"
 log "Category: ${JOB_CATEGORY}"
+
+# Log debug mode status
+if [ "${DEBUG_MODE:-false}" = "true" ]; then
+    log "DEBUG MODE ENABLED - Verbose logging active"
+    debug_log "Debug mode initialized for comprehensive troubleshooting"
+fi
 
 VIDEO_FILE=$(find "$JOB_PATH" -type f \( -name "*.mkv" -o -name "*.mp4" -o -name "*.avi" -o -name "*.mov" \) -printf '%s %p\n' | sort -rn | head -n 1 | cut -d' ' -f2-)
 if [ -z "$VIDEO_FILE" ]; then

@@ -182,10 +182,76 @@ ENABLE_LOCAL_CPU="true"     # Local (NAS) CPU fallback
 ### **Q: Progress bar isn’t updating?**
 - Check logs for last “FFMPEG:” line.
 - Possible ffmpeg crash, stalled pipe, or resource overload.
-- **v4.3 Enhanced Stall Detection:** Script now tracks actual progress advancement (time/frames) and kills hung processes after 2 minutes of no progress.
-- Added timeout wrapper (2 hours max) and improved SSH connection handling.
+- **v4.4 Comprehensive Debugging:** Script now includes extensive debugging capabilities to identify root causes of hangs.
+- Added network diagnostics, SSH connection monitoring, and detailed progress tracking.
+- Enable with `DEBUG_MODE="true"` in `transcode.conf` for troubleshooting.
 - Check logs for "ERROR: FFmpeg appears to be stalled" message.
 - Common causes: Network issues, SSH connection drops, GPU driver problems.
+
+## 🔍 **Debugging Hangs and Connection Issues**
+
+If your script is freezing or hanging during transcoding, follow these steps to identify the root cause:
+
+### **Step 1: Enable Debug Mode**
+Edit `transcode.conf` and set:
+```bash
+DEBUG_MODE="true"
+```
+
+### **Step 2: Run a Test Job**
+Process a video file and let it run (or hang). Debug mode will generate extensive logs including:
+- **Network diagnostics** (ping, SSH connectivity, authentication)
+- **Remote system info** (uptime, memory, load, GPU processes)
+- **SSH connection monitoring** (CPU/memory usage, connection status)
+- **Detailed progress tracking** (frame advancement, bitrate, timeouts)
+
+### **Step 3: Analyze the Debug Logs**
+Look for these key indicators in your logs:
+
+**Network Issues:**
+```
+DEBUG: PING: 192.168.7.16 is NOT reachable
+DEBUG: TCP: Port 22 on 192.168.7.16 is NOT accessible
+DEBUG: SSH: Authentication failed or timeout
+```
+
+**Remote System Problems:**
+```
+DEBUG: REMOTE: MEMORY: Mem: 32G used, 0B available
+DEBUG: REMOTE: LOAD: 15.2 8.3 4.1 (high load average)
+DEBUG: REMOTE: GPU_PROCESSES: 10 (too many processes)
+```
+
+**Connection Monitoring:**
+```
+DEBUG: SSH_MONITOR: iGPU connection active for 300s (PID: 1234)
+DEBUG: SSH_MONITOR: CPU: 0.0%, MEM: 0.1% (process not working)
+```
+
+**Progress Stalls:**
+```
+DEBUG: PROGRESS_TIMEOUT: No data for 5s (cycle 24, connection issues: 120)
+DEBUG: STALL_DETECTED: Progress updates: 5000, Last frame: 62754, Last time: 2617s
+```
+
+### **Step 4: Identify Root Cause**
+Based on the debug output:
+
+- **Network Issues**: Check firewall, router, cable connections
+- **SSH Problems**: Verify SSH key, user permissions, SSH service status
+- **Remote System Overload**: Check memory usage, kill stuck processes, reboot remote machine
+- **GPU Driver Issues**: Update GPU drivers, check for hardware problems
+- **File System Issues**: Check disk space, file permissions, NFS/SMB mount problems
+
+### **Step 5: Disable Debug Mode**
+Once you've identified the issue, set:
+```bash
+DEBUG_MODE="false"
+```
+
+**Warning:** Debug mode generates very verbose logs and can impact performance. Only enable when troubleshooting.
+
+---
 
 ### **Q: Sonarr/Radarr import fails after transcode?**
 - Confirm `.mp4` exists (not just `.tmp.mp4`).
@@ -217,7 +283,7 @@ ENABLE_LOCAL_CPU="true"     # Local (NAS) CPU fallback
 ## 📋 Version & Author
 
 - **Author:** [KPKev](https://github.com/KPKev) & [Gemini] & [OpenAI 4.1 - Robust Recovery]
-- **Version:** 4.3 (Enhanced Stall Detection, July 2025)
+- **Version:** 4.4 (Comprehensive Debugging, July 2025)
 - **License:** MIT / Open
 
 ---
