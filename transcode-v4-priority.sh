@@ -51,6 +51,7 @@ RECOVERY_MIN_SIZE="${RECOVERY_MIN_SIZE:-104857600}"
 RECOVERY_LOG_FILE="${RECOVERY_LOG_FILE:-recovery.log}"
 GPU_ENCODE_MODE="${GPU_ENCODE_MODE:-cqp}"
 GPU_CQ_LEVEL="${GPU_CQ_LEVEL:-25}"
+DEBUG_MODE="${DEBUG_MODE:-false}"
 
 # --- Sabnzbd Environment Variables ---
 JOB_PATH="$1"
@@ -301,30 +302,37 @@ tmp_recovery_check() {
 read_progress_and_log() {
     local ENCODER_LABEL=$1
     local FFMPEG_PID=$2
+    local FFMPEG_RAW_LOG=$3
     local spinner="/-\\|"
     local spin_i=0
     local last_percentage=-1
     local current_speed="1"
     local etr_str="--:--"
-    local last_frame=0
     local current_frame=0
-    local stall_count=0
-    local max_stall_cycles=24  # 24 * 5 seconds = 2 minutes of no progress before timeout
-    local last_progress_time=$(date +%s)
-    local current_time_us=0
-    local last_time_us=0
     local progress_updates=0
     local last_bitrate="0"
-    local connection_issues=0
+    local progress_s=0
     
-    TOTAL_DURATION_S=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" | cut -d. -f1)
+    TOTAL_DURATION_S=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" 2>/dev/null | cut -d. -f1)
     [ -z "$TOTAL_DURATION_S" ] && TOTAL_DURATION_S=1
     
     debug_log "=== Progress Monitoring Started for $ENCODER_LABEL (PID: $FFMPEG_PID) ==="
     debug_log "PROGRESS_INIT: Total duration: ${TOTAL_DURATION_S}s, File: $(basename "$VIDEO_FILE")"
-    
+
+    # Wait for the log file to be created by the main process.
+    local wait_count=0
+    while [ ! -f "$FFMPEG_RAW_LOG" ] && [ "$wait_count" -lt 50 ]; do
+        sleep 0.1
+        wait_count=$((wait_count + 1))
+    done
+
+    # Open a read-only file descriptor to the tail process. This avoids subshell issues
+    # and prevents the 'read' command from blocking the main loop.
+    exec 3< <(tail -n 0 -f "$FFMPEG_RAW_LOG")
+
     while kill -0 "$FFMPEG_PID" 2>/dev/null; do
-        if IFS= read -r -t 5 line; then
+        # Read one line from the tail process with a 5-second timeout.
+        if IFS= read -r -u 3 -t 5 line; then
             if echo "$line" | grep -q '='; then
                 key=$(echo "$line" | cut -d'=' -f1)
                 value=$(echo "$line" | cut -d'=' -f2 | tr -d '[:space:]')
@@ -336,67 +344,26 @@ read_progress_and_log() {
                     percent=$(( (progress_s * 100) / (TOTAL_DURATION_S > 0 ? TOTAL_DURATION_S : 1) ))
                     [ $percent -gt 100 ] && percent=100
                     last_percentage=$percent
-                    # Check if progress is actually advancing
-                    if [ "$current_time_us" -gt "$last_time_us" ]; then
-                        last_progress_time=$(date +%s)
-                        last_time_us=$current_time_us
-                        stall_count=0
-                        debug_log "PROGRESS_ADVANCE: Time ${progress_s}s/${TOTAL_DURATION_S}s (${percent}%)"
-                    fi
                 elif [ "$key" = "speed" ]; then
                     current_speed=$(echo "$value" | sed 's/x//' | cut -d. -f1)
                     [ -z "$current_speed" ] && current_speed=1
                 elif [ "$key" = "frame" ]; then
                     current_frame=$value
-                    # Check if frame is actually advancing
-                    if [ "$current_frame" -gt "$last_frame" ]; then
-                        last_progress_time=$(date +%s)
-                        last_frame=$current_frame
-                        stall_count=0
-                        debug_log "PROGRESS_ADVANCE: Frame ${current_frame} (Speed: ${current_speed}x)"
-                    fi
                 elif [ "$key" = "bitrate" ]; then
                     last_bitrate=$value
                 fi
                 
-                # Log detailed progress every 100 updates
                 if [ $((progress_updates % 100)) -eq 0 ]; then
                     debug_log "PROGRESS_STATUS: Updates: $progress_updates, Frame: $current_frame, Time: ${progress_s}s, Speed: ${current_speed}x, Bitrate: $last_bitrate"
                 fi
             else
+                # Log any non-progress output from ffmpeg's stderr
                 echo "$(date +'%Y-%m-%d %H:%M:%S') | FFMPEG: $line" >> "$MAIN_LOG_FILE"
                 debug_log "FFMPEG_OUTPUT: $line"
             fi
-        else
-            # No data received within timeout, check for stall
-            local current_epoch=$(date +%s)
-            local time_since_progress=$((current_epoch - last_progress_time))
-            connection_issues=$((connection_issues + 1))
-            
-            debug_log "PROGRESS_TIMEOUT: No data for 5s (cycle $stall_count, connection issues: $connection_issues, time since progress: ${time_since_progress}s)"
-            
-            if [ "$time_since_progress" -gt 120 ]; then  # 2 minutes
-                echo
-                log "ERROR: FFmpeg appears to be stalled (no progress for ${time_since_progress}s). Killing process..."
-                debug_log "STALL_DETECTED: Progress updates: $progress_updates, Last frame: $last_frame, Last time: ${progress_s}s"
-                kill -TERM "$FFMPEG_PID" 2>/dev/null || true
-                sleep 3
-                kill -KILL "$FFMPEG_PID" 2>/dev/null || true
-                return 1
-            fi
-            
-            stall_count=$((stall_count + 1))
-            if [ "$stall_count" -gt "$max_stall_cycles" ]; then
-                echo
-                log "ERROR: FFmpeg timeout - no data received for ${stall_count} cycles. Killing process..."
-                debug_log "TIMEOUT_DETECTED: Connection issues: $connection_issues, Progress updates: $progress_updates"
-                kill -TERM "$FFMPEG_PID" 2>/dev/null || true
-                sleep 3
-                kill -KILL "$FFMPEG_PID" 2>/dev/null || true
-                return 1
-            fi
         fi
         
+        # Update spinner and ETA regardless of progress updates
         if [ "$current_speed" -gt "0" ] && [ "$TOTAL_DURATION_S" -gt 0 ] && [ "${progress_s:-0}" -gt 0 ]; then
             remaining_s=$(( (TOTAL_DURATION_S - progress_s) / current_speed ))
             etr_str=$(printf "%02d:%02d" $((remaining_s / 60)) $((remaining_s % 60)))
@@ -405,10 +372,14 @@ read_progress_and_log() {
         spinner_char=$(echo "$spinner" | cut -c $((spin_i + 1)))
         printf "\r[%s] %s: %s%% | Speed: %sx | ETA: %s | Frame: %s" "$spinner_char" "$ENCODER_LABEL" "$last_percentage" "$current_speed" "$etr_str" "$current_frame"
     done
+    
+    # Clean up the file descriptor
+    exec 3<&-
+    
     echo
     
     debug_log "=== Progress Monitoring Ended for $ENCODER_LABEL ==="
-    debug_log "PROGRESS_SUMMARY: Total updates: $progress_updates, Connection issues: $connection_issues, Final frame: $current_frame, Final time: ${progress_s}s"
+    debug_log "PROGRESS_SUMMARY: Total updates: $progress_updates, Final frame: $current_frame, Final time: ${progress_s}s"
 }
 
 check_remote_host() {
@@ -427,90 +398,36 @@ run_remote_igpu() {
     log "--- Starting Remote iGPU Transcode (QSV) ---"
     disk_space_warn
     
-    # Run network diagnostics if debug mode is enabled
     if [ "${DEBUG_MODE:-false}" = "true" ]; then
         network_diagnostics "$SSH_HOST" "$SSH_PORT"
     fi
     
-    local LOG_SUFFIX="igpu"
-    local PROGRESS_PIPE="${LOG_FILE_BASE}_${LOG_SUFFIX}_progress.pipe"
-    local FFMPEG_STDERR_LOG="${LOG_FILE_BASE}_${LOG_SUFFIX}_stderr.log"
-    mkfifo "$PROGRESS_PIPE"
-    
+    local FFMPEG_STDERR_LOG="${LOG_FILE_BASE}_igpu_stderr.log"
     local FFMPEG_CMD_REMOTE=""
     if [ "$GPU_ENCODE_MODE" = "cqp" ]; then
         log_debug "Using CQP (ICQ) mode for iGPU with quality level ${GPU_CQ_LEVEL}"
-        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y \
-            -progress pipe:2 -i - \
-            -map 0:v:0 -map 0:a:0? \
-            -c:v h264_qsv -preset:v ${QSV_PRESET} -profile:v high -level:v 4.1 -pix_fmt yuv420p \
-            -global_quality ${GPU_CQ_LEVEL} \
-            -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" \
-            ${AUDIO_PARAMS} \
-            -movflags frag_keyframe+empty_moov -f mp4 -"
+        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y -progress pipe:2 -protocol_whitelist file,pipe,fd -i - -map 0:v:0? -map 0:a:0? -c:v h264_qsv -preset:v ${QSV_PRESET} -profile:v high -level:v 4.1 -pix_fmt yuv420p -global_quality ${GPU_CQ_LEVEL} -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" ${AUDIO_PARAMS} -movflags frag_keyframe+empty_moov -f mp4 -"
     else
         log_debug "Using Bitrate mode for iGPU with target ${BITRATE_TARGET}"
-        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y \
-            -progress pipe:2 \
-            -i - \
-            -map 0:v:0 -map 0:a:0? \
-            -c:v h264_qsv -preset:v ${QSV_PRESET} -profile:v high -level:v 4.0 -pix_fmt yuv420p \
-            -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" \
-            -b:v ${BITRATE_TARGET} -maxrate:v ${BITRATE_MAX} -bufsize:v ${BITRATE_BUFSIZE} \
-            ${AUDIO_PARAMS} \
-            -movflags frag_keyframe+empty_moov -f mp4 -"
+        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y -progress pipe:2 -protocol_whitelist file,pipe,fd -i - -map 0:v:0? -map 0:a:0? -c:v h264_qsv -preset:v ${QSV_PRESET} -profile:v high -level:v 4.0 -pix_fmt yuv420p -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" -b:v ${BITRATE_TARGET} -maxrate:v ${BITRATE_MAX} -bufsize:v ${BITRATE_BUFSIZE} ${AUDIO_PARAMS} -movflags frag_keyframe+empty_moov -f mp4 -"
     fi
+    debug_log "FFMPEG_CMD_REMOTE: '$FFMPEG_CMD_REMOTE'"
+    
+    ssh -T -o "ConnectTimeout=15" -o "StrictHostKeyChecking=no" -o "SendEnv=LC_*" -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "TCPKeepAlive=yes" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
+        "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> "$FFMPEG_STDERR_LOG" &
+    local SSH_PID=$!
+    debug_log "SSH_STARTED: PID $SSH_PID for iGPU transcode"
 
-    debug_log "REMOTE_CMD: $FFMPEG_CMD_REMOTE"
-    timeout 7200 ssh -T -o "ConnectTimeout=15" -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "StrictHostKeyChecking=no" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
-        "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> >(tee "$PROGRESS_PIPE" > "$FFMPEG_STDERR_LOG") &
-    local ssh_pid=$!
-    debug_log "SSH_STARTED: PID $ssh_pid for iGPU transcode"
+    read_progress_and_log "Remote iGPU" "$SSH_PID" "$FFMPEG_STDERR_LOG"
     
-    # Start SSH connection monitoring in background if debug mode is enabled
-    if [ "${DEBUG_MODE:-false}" = "true" ]; then
-        monitor_ssh_connection "$ssh_pid" "iGPU" &
-        local monitor_pid=$!
-        debug_log "SSH_MONITOR: Started monitor PID $monitor_pid"
-    fi
-    
-    log "--- FFMPEG Output for Remote iGPU ---"
-    if ! read_progress_and_log "Remote iGPU" "$ssh_pid" < "$PROGRESS_PIPE"; then
-        log "Progress monitoring detected stall, killing SSH connection..."
-        debug_log "SSH_KILL: Terminating SSH PID $ssh_pid due to stall"
-        kill -TERM "$ssh_pid" 2>/dev/null || true
-        sleep 2
-        kill -KILL "$ssh_pid" 2>/dev/null || true
-    fi
-    
-    # Kill the monitor process if it's running
-    if [ "${DEBUG_MODE:-false}" = "true" ] && [ -n "${monitor_pid:-}" ]; then
-        kill "$monitor_pid" 2>/dev/null || true
-    fi
-    log "--- End of FFMPEG Output for Remote iGPU ---"
-    
-    wait $ssh_pid || true
-    local ssh_ec=$?
-    rm -f "$PROGRESS_PIPE"
+    wait "$SSH_PID"
+    local SSH_EC=$?
 
-    if [ $ssh_ec -eq 0 ] && [ -s "$TEMP_OUTPUT_FILE" ]; then
+    if [ "$SSH_EC" -eq 0 ] && is_mp4_playable_and_valid "$VIDEO_FILE" "$TEMP_OUTPUT_FILE"; then
         log "Remote iGPU transcode completed successfully."
-        rm -f "$FFMPEG_STDERR_LOG"
         return 0
     else
-        log "Remote iGPU transcode failed. Exit code: $ssh_ec."
-        if [ -f "$FFMPEG_STDERR_LOG" ]; then
-            log "--- FFMPEG Stderr Dump (iGPU) ---"
-            cat "$FFMPEG_STDERR_LOG" >> "$MAIN_LOG_FILE"
-            log "--- End of Stderr Dump ---"
-            rm -f "$FFMPEG_STDERR_LOG"
-        fi
-        if [ -s "$TEMP_OUTPUT_FILE" ]; then
-            log_debug "WARN: .tmp.mp4 output exists and is non-empty. Attempting auto-promote if valid."
-            promote_tmp_if_valid "$VIDEO_FILE" "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE" || rm -f "$TEMP_OUTPUT_FILE"
-        else
-            rm -f "$TEMP_OUTPUT_FILE"
-        fi
+        log "Remote iGPU transcode failed. Exit code: $SSH_EC."
         return 1
     fi
 }
@@ -518,68 +435,37 @@ run_remote_igpu() {
 run_remote_dgpu() {
     log "--- Starting Remote dGPU Transcode (NVENC) ---"
     disk_space_warn
-    local LOG_SUFFIX="dgpu"
-    local PROGRESS_PIPE="${LOG_FILE_BASE}_${LOG_SUFFIX}_progress.pipe"
-    local FFMPEG_STDERR_LOG="${LOG_FILE_BASE}_${LOG_SUFFIX}_stderr.log"
-    mkfifo "$PROGRESS_PIPE"
 
+    if [ "${DEBUG_MODE:-false}" = "true" ]; then
+        network_diagnostics "$SSH_HOST" "$SSH_PORT"
+    fi
+    
+    local FFMPEG_STDERR_LOG="${LOG_FILE_BASE}_dgpu_stderr.log"
     local FFMPEG_CMD_REMOTE=""
     if [ "$GPU_ENCODE_MODE" = "cqp" ]; then
         log_debug "Using CQP mode for dGPU with quality level ${GPU_CQ_LEVEL}"
-        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y -i - \
-            -progress pipe:2 \
-            -map 0:v:0 -map 0:a:0? \
-            -c:v h264_nvenc -preset:v ${NVENC_PRESET} -profile:v high -level:v 4.1 -pix_fmt yuv420p \
-            -rc:v constqp -qp ${GPU_CQ_LEVEL} \
-            -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" \
-            ${AUDIO_PARAMS} \
-            -movflags frag_keyframe+empty_moov -f mp4 -"
+        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y -progress pipe:2 -protocol_whitelist file,pipe,fd -i - -map 0:v:0? -map 0:a:0? -c:v h264_nvenc -preset:v ${NVENC_PRESET} -profile:v high -level:v 4.1 -pix_fmt yuv420p -rc:v constqp -qp ${GPU_CQ_LEVEL} -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" ${AUDIO_PARAMS} -movflags frag_keyframe+empty_moov -f mp4 -"
     else
         log_debug "Using Bitrate (VBR) mode for dGPU with target ${BITRATE_TARGET}"
-        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y -i - \
-            -progress pipe:2 \
-            -map 0:v:0 -map 0:a:0? \
-            -c:v h264_nvenc -preset:v ${NVENC_PRESET} -profile:v high -level:v 4.0 -pix_fmt yuv420p \
-            -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" \
-            -rc:v vbr_hq -b:v ${BITRATE_TARGET} -maxrate:v ${BITRATE_MAX} -bufsize:v ${BITRATE_BUFSIZE} \
-            ${AUDIO_PARAMS} \
-            -movflags frag_keyframe+empty_moov -f mp4 -"
+        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y -progress pipe:2 -protocol_whitelist file,pipe,fd -i - -map 0:v:0? -map 0:a:0? -c:v h264_nvenc -preset:v ${NVENC_PRESET} -profile:v high -level:v 4.0 -pix_fmt yuv420p -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" -rc:v vbr_hq -b:v ${BITRATE_TARGET} -maxrate:v ${BITRATE_MAX} -bufsize:v ${BITRATE_BUFSIZE} ${AUDIO_PARAMS} -movflags frag_keyframe+empty_moov -f mp4 -"
     fi
+    debug_log "FFMPEG_CMD_REMOTE: '$FFMPEG_CMD_REMOTE'"
 
-    timeout 7200 ssh -T -o "ConnectTimeout=15" -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "StrictHostKeyChecking=no" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
-        "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> >(tee "$PROGRESS_PIPE" > "$FFMPEG_STDERR_LOG") &
-    local ssh_pid=$!
-    log "--- FFMPEG Output for Remote dGPU ---"
-    if ! read_progress_and_log "Remote dGPU" "$ssh_pid" < "$PROGRESS_PIPE"; then
-        log "Progress monitoring detected stall, killing SSH connection..."
-        kill -TERM "$ssh_pid" 2>/dev/null || true
-        sleep 2
-        kill -KILL "$ssh_pid" 2>/dev/null || true
-    fi
-    log "--- End of FFMPEG Output for Remote dGPU ---"
+    ssh -T -o "ConnectTimeout=15" -o "StrictHostKeyChecking=no" -o "SendEnv=LC_*" -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "TCPKeepAlive=yes" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
+        "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> "$FFMPEG_STDERR_LOG" &
+    local SSH_PID=$!
+    debug_log "SSH_STARTED: PID $SSH_PID for dGPU transcode"
 
-    wait $ssh_pid || true
-    local ssh_ec=$?
-    rm -f "$PROGRESS_PIPE"
+    read_progress_and_log "Remote dGPU" "$SSH_PID" "$FFMPEG_STDERR_LOG"
 
-    if [ $ssh_ec -eq 0 ] && [ -s "$TEMP_OUTPUT_FILE" ]; then
+    wait "$SSH_PID"
+    local SSH_EC=$?
+
+    if [ "$SSH_EC" -eq 0 ] && is_mp4_playable_and_valid "$VIDEO_FILE" "$TEMP_OUTPUT_FILE"; then
         log "Remote dGPU transcode completed successfully."
-        rm -f "$FFMPEG_STDERR_LOG"
         return 0
     else
-        log "Remote dGPU transcode failed. Exit code: $ssh_ec."
-        if [ -f "$FFMPEG_STDERR_LOG" ]; then
-            log "--- FFMPEG Stderr Dump (dGPU) ---"
-            cat "$FFMPEG_STDERR_LOG" >> "$MAIN_LOG_FILE"
-            log "--- End of Stderr Dump ---"
-            rm -f "$FFMPEG_STDERR_LOG"
-        fi
-        if [ -s "$TEMP_OUTPUT_FILE" ]; then
-            log_debug "WARN: .tmp.mp4 output exists and is non-empty. Attempting auto-promote if valid."
-            promote_tmp_if_valid "$VIDEO_FILE" "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE" || rm -f "$TEMP_OUTPUT_FILE"
-        else
-            rm -f "$TEMP_OUTPUT_FILE"
-        fi
+        log "Remote dGPU transcode failed. Exit code: $SSH_EC."
         return 1
     fi
 }
@@ -587,45 +473,27 @@ run_remote_dgpu() {
 run_local_cpu() {
     log "--- Starting Local CPU Transcode (libx264) ---"
     disk_space_warn
-    local LOG_SUFFIX="cpu"
-    local PROGRESS_PIPE="${LOG_FILE_BASE}_${LOG_SUFFIX}_progress.pipe"
-    local FFMPEG_STDERR_LOG="${LOG_FILE_BASE}_${LOG_SUFFIX}_stderr.log"
-    mkfifo "$PROGRESS_PIPE"
-    local SCALE_FILTER="scale=w='min(iw,${RESOLUTION_MAX%x*})':h='min(ih,${RESOLUTION_MAX#*x})':force_original_aspect_ratio=decrease"
-    ffmpeg -hide_banner -loglevel error -progress pipe:1 -y \
-        -i "$VIDEO_FILE" \
-        -map 0:v:0 -map 0:a:0? \
-        -c:v libx264 -preset slow -crf 23 -pix_fmt yuv420p \
-        -vf "$SCALE_FILTER" \
-        ${AUDIO_PARAMS} \
-        -movflags frag_keyframe+empty_moov -f mp4 "$TEMP_OUTPUT_FILE" > "$PROGRESS_PIPE" 2>"$FFMPEG_STDERR_LOG" &
-    local ffmpeg_pid=$!
-    log "--- FFMPEG Output for Local CPU ---"
-    read_progress_and_log "Local CPU" "$ffmpeg_pid" < "$PROGRESS_PIPE"
-    log "--- End of FFMPEG Output for Local CPU ---"
     
-    wait $ffmpeg_pid || true
-    local ffmpeg_ec=$?
-    rm -f "$PROGRESS_PIPE"
+    local FFMPEG_STDERR_LOG="${LOG_FILE_BASE}_cpu_stderr.log"
+    local SCALE_FILTER="scale=w='min(iw,${RESOLUTION_MAX%x*})':h='min(ih,${RESOLUTION_MAX#*x})':force_original_aspect_ratio=decrease"
+    
+    local LOCAL_FFMPEG_CMD="ffmpeg -hide_banner -loglevel error -y -progress pipe:2 -i \"$VIDEO_FILE\" -map 0:v:0? -map 0:a:0? -c:v libx264 -preset slow -crf 23 -pix_fmt yuv420p -vf \"$SCALE_FILTER\" ${AUDIO_PARAMS} -movflags frag_keyframe+empty_moov -f mp4 \"$TEMP_OUTPUT_FILE\""
+    debug_log "LOCAL_FFMPEG_CMD: $LOCAL_FFMPEG_CMD"
+    
+    # Execute ffmpeg in the background, redirecting stderr to a log file
+    bash -c "$LOCAL_FFMPEG_CMD" 2> "$FFMPEG_STDERR_LOG" &
+    local FFMPEG_PID=$!
+    
+    read_progress_and_log "Local CPU" "$FFMPEG_PID" "$FFMPEG_STDERR_LOG"
+    
+    wait "$FFMPEG_PID"
+    local FFMPEG_EC=$?
 
-    if [ $ffmpeg_ec -eq 0 ] && [ -s "$TEMP_OUTPUT_FILE" ]; then
+    if [ "$FFMPEG_EC" -eq 0 ] && is_mp4_playable_and_valid "$VIDEO_FILE" "$TEMP_OUTPUT_FILE"; then
         log "Local CPU transcode completed successfully."
-        rm -f "$FFMPEG_STDERR_LOG"
         return 0
     else
-        log "Local CPU transcode failed. Exit code: $ffmpeg_ec."
-        if [ -f "$FFMPEG_STDERR_LOG" ]; then
-            log "--- FFMPEG Stderr Dump (CPU) ---"
-            cat "$FFMPEG_STDERR_LOG" >> "$MAIN_LOG_FILE"
-            log "--- End of Stderr Dump ---"
-            rm -f "$FFMPEG_STDERR_LOG"
-        fi
-        if [ -s "$TEMP_OUTPUT_FILE" ]; then
-            log_debug "WARN: .tmp.mp4 output exists and is non-empty. Attempting auto-promote if valid."
-            promote_tmp_if_valid "$VIDEO_FILE" "$TEMP_OUTPUT_FILE" "$FINAL_OUTPUT_FILE" || rm -f "$TEMP_OUTPUT_FILE"
-        else
-            rm -f "$TEMP_OUTPUT_FILE"
-        fi
+        log "Local CPU transcode failed. Exit code: $FFMPEG_EC."
         return 1
     fi
 }
@@ -754,10 +622,25 @@ log "Job Name: ${JOB_NAME}"
 log "Job Path: ${JOB_PATH}"
 log "Category: ${JOB_CATEGORY}"
 
-# Log debug mode status
+# Log debug mode status and verify configuration loading
+log "DEBUG_MODE status: '${DEBUG_MODE}' (from config: $(grep '^DEBUG_MODE=' "$CONFIG_FILE" 2>/dev/null || echo 'not found'))"
 if [ "${DEBUG_MODE:-false}" = "true" ]; then
     log "DEBUG MODE ENABLED - Verbose logging active"
     debug_log "Debug mode initialized for comprehensive troubleshooting"
+    debug_log "=== Environment & Configuration Debug ==="
+    debug_log "SCRIPT_VERSION: v4.4 Comprehensive Debugging"
+    debug_log "SHELL: $0"
+    debug_log "PWD: $(pwd)"
+    debug_log "USER: $(whoami)"
+    debug_log "HOSTNAME: $(hostname)"
+    debug_log "DATE: $(date)"
+    debug_log "CONFIG_FILE: $CONFIG_FILE"
+    debug_log "TRANSCODE_PRIORITY: '$TRANSCODE_PRIORITY'"
+    debug_log "ENABLE_REMOTE_IGPU: '$ENABLE_REMOTE_IGPU'"
+    debug_log "ENABLE_REMOTE_DGPU: '$ENABLE_REMOTE_DGPU'"
+    debug_log "ENABLE_LOCAL_CPU: '$ENABLE_LOCAL_CPU'"
+else
+    log "DEBUG MODE DISABLED - Only basic logging active"
 fi
 
 VIDEO_FILE=$(find "$JOB_PATH" -type f \( -name "*.mkv" -o -name "*.mp4" -o -name "*.avi" -o -name "*.mov" \) -printf '%s %p\n' | sort -rn | head -n 1 | cut -d' ' -f2-)
@@ -767,11 +650,26 @@ if [ -z "$VIDEO_FILE" ]; then
 fi
 log "Found video file: $VIDEO_FILE"
 
+# Debug: Log detailed file information
+debug_log "=== Video File Analysis ==="
+debug_log "VIDEO_FILE: '$VIDEO_FILE'"
+debug_log "FILE_SIZE: $(stat -c %s "$VIDEO_FILE" 2>/dev/null || echo "unknown") bytes"
+debug_log "FILE_PERMS: $(stat -c %A "$VIDEO_FILE" 2>/dev/null || echo "unknown")"
+debug_log "FILE_OWNER: $(stat -c %U:%G "$VIDEO_FILE" 2>/dev/null || echo "unknown")"
+
 VIDEO_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" 2>/dev/null)
 AUDIO_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" 2>/dev/null)
 AUDIO_CHANNELS=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" 2>/dev/null)
 CONTAINER=$(basename "$VIDEO_FILE" | rev | cut -d . -f 1 | rev)
 log "Detected format: Container=$CONTAINER, Video=$VIDEO_CODEC, Audio=$AUDIO_CODEC (${AUDIO_CHANNELS}ch)"
+
+# Debug: Log complete ffprobe information
+debug_log "=== Complete Media Information ==="
+if [ "${DEBUG_MODE:-false}" = "true" ]; then
+    ffprobe -v quiet -print_format json -show_format -show_streams "$VIDEO_FILE" 2>/dev/null | while IFS= read -r line; do
+        debug_log "FFPROBE: $line"
+    done
+fi
 
 if [ "$CONTAINER" = "mp4" ] && [ "$VIDEO_CODEC" = "h264" ] && [ "$AUDIO_CODEC" = "aac" ] && [ "$AUDIO_CHANNELS" -le 2 ]; then
     log "File is already compliant. No transcoding needed."

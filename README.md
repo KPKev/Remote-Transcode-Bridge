@@ -69,10 +69,14 @@ No stranded `.tmp` files, no more import failures—just reliable automation.
 
 ## ⚙️ Configuration: `transcode.conf`
 
-### **Transcoder Priority**
-Define the order as a space-separated string:
+### **Transcoder Priority & Control**
+Define the order of transcoders to try. The script will attempt them in this sequence. If one fails or is disabled, it moves to the next.
+Available options: `"remote_igpu"`, `"remote_dgpu"`, `"local_cpu"`
 ```sh
 TRANSCODE_PRIORITY="remote_igpu remote_dgpu local_cpu"
+
+# --- Individual Transcoder Settings ---
+# Enable or disable each specific transcoder. Set to "true" or "false".
 ENABLE_REMOTE_IGPU="true"   # Intel QSV on remote
 ENABLE_REMOTE_DGPU="true"   # Nvidia NVENC on remote
 ENABLE_LOCAL_CPU="true"     # Local (NAS) CPU fallback
@@ -85,10 +89,26 @@ ENABLE_LOCAL_CPU="true"     # Local (NAS) CPU fallback
 - `SSH_KEY`: Private key path (inside SABnzbd container—e.g. `/config/.ssh/id_rsa`)
 - `SSH_PORT`: (usually `22`)
 
-### **Encoding Settings**
-- `BITRATE_TARGET`, `BITRATE_MAX`, `BITRATE_BUFSIZE`: Tune for your network/TVs
+### **Encoding Quality (New Method)**
+
+The new script offers two primary modes for controlling GPU encoding quality, set by `GPU_ENCODE_MODE`.
+
+1.  **Constant Quality (`cqp`)** - *Recommended*
+    This mode aims for a consistent visual quality level. The final file size will vary depending on the complexity of the source video.
+    - `GPU_ENCODE_MODE="cqp"`
+    - `GPU_CQ_LEVEL="22"`: The target quality level. Lower values mean higher quality and larger files. (Range: 1-51, Recommended: 20-30).
+
+2.  **Variable Bitrate (`bitrate`)** - *Legacy*
+    This mode aims for a predictable file size by targeting a specific bitrate.
+    - `GPU_ENCODE_MODE="bitrate"`
+    - `BITRATE_TARGET`, `BITRATE_MAX`, `BITRATE_BUFSIZE`: Tune for your network/TVs.
+
+> **Note:** The `BITRATE_*` settings are only used if `GPU_ENCODE_MODE` is set to `"bitrate"`.
+
+### **Advanced Encoder Settings**
 - `RESOLUTION_MAX`: e.g. `1920x1080` for 1080p output
-- `QSV_PRESET`, `NVENC_PRESET`: e.g. `slow`, `p4` (see script for more)
+- `QSV_PRESET`: Preset for Intel QSV encoder (e.g. `slow`, `veryslow`). Slower means better quality.
+- `NVENC_PRESET`: Preset for Nvidia NVENC encoder (e.g. `p1`-`p7`). `p1` is worst quality, `p7` is best. `p4` is a good starting point.
 
 ### **Media Server APIs**
 - `SONARR_URL` / `SONARR_API_KEY`
@@ -101,6 +121,7 @@ ENABLE_LOCAL_CPU="true"     # Local (NAS) CPU fallback
 - `ENABLE_TMP_RECOVERY="true"`: Enable auto-recovery of orphan `.tmp.mp4`
 - `RECOVERY_LOG_FILE="recovery.log"`: Track every recovery event
 - `VERBOSE_LOGGING="true"`: See even more details in main log (for debugging)
+- `DEBUG_MODE="true"`: Ultra-verbose logging for deep troubleshooting.
 
 ---
 
@@ -182,11 +203,7 @@ ENABLE_LOCAL_CPU="true"     # Local (NAS) CPU fallback
 ### **Q: Progress bar isn’t updating?**
 - Check logs for last “FFMPEG:” line.
 - Possible ffmpeg crash, stalled pipe, or resource overload.
-- **v4.4 Comprehensive Debugging:** Script now includes extensive debugging capabilities to identify root causes of hangs.
-- Added network diagnostics, SSH connection monitoring, and detailed progress tracking.
-- Enable with `DEBUG_MODE="true"` in `transcode.conf` for troubleshooting.
-- Check logs for "ERROR: FFmpeg appears to be stalled" message.
-- Common causes: Network issues, SSH connection drops, GPU driver problems.
+- **v4.4 Comprehensive Debugging:** Script now includes extensive debugging capabilities to identify root causes of hangs and command failures.
 
 ## 🔍 **Debugging Hangs and Connection Issues**
 
@@ -197,6 +214,66 @@ Edit `transcode.conf` and set:
 ```bash
 DEBUG_MODE="true"
 ```
+
+**⚠️ WARNING:** Debug mode generates VERY verbose logs. Only enable when actively troubleshooting!
+
+### **Step 2: What Debug Mode Captures**
+
+When enabled, the script logs comprehensive information:
+
+**Environment & Configuration:**
+- Script version, shell environment, working directory
+- Complete configuration variables and transcoder settings
+- Priority order and enabled/disabled transcoders
+
+**Video File Analysis:**
+- File path, size, permissions, ownership details
+- Complete ffprobe output with all stream information
+- Container format, codecs, and audio configuration
+
+**FFmpeg Command Construction:**
+- All variables used in command building (presets, quality levels, resolution limits)
+- Complete FFmpeg command string before SSH transmission
+- Command length validation and parameter checking
+
+**SSH Connection Monitoring:**
+- Network diagnostics (ping, port connectivity, authentication tests)
+- Remote system status (uptime, memory, load, existing GPU processes)
+- Real-time connection monitoring with CPU/memory usage tracking
+- Immediate error detection and early termination analysis
+
+**Error Analysis:**
+- Complete stderr capture from FFmpeg processes
+- Exit codes and output file size analysis
+- Stream mapping error detection and command validation
+
+### **Step 3: Debug Log Examples**
+
+Debug entries are clearly categorized:
+```bash
+2025-01-27 10:30:15 | DEBUG: === dGPU Command Construction Debug ===
+2025-01-27 10:30:15 | DEBUG: GPU_ENCODE_MODE: 'cqp'
+2025-01-27 10:30:15 | DEBUG: FFMPEG_CMD_REMOTE: 'ffmpeg -hide_banner...'
+2025-01-27 10:30:15 | DEBUG: SSH_STATUS: Process 12345 exited quickly - checking for immediate errors
+2025-01-27 10:30:15 | DEBUG: EARLY_ERROR: Stream map '' matches no streams
+```
+
+### **Step 4: Common Issues Identified by Debug Mode**
+
+**"Stream map '' matches no streams" Error:**
+- FFmpeg command construction failure
+- Variable expansion issues in SSH transmission
+- Solution: Check audio parameters and stream mapping logic
+
+**SSH Connection Problems:**
+- Authentication failures or network connectivity
+- Remote system resource constraints
+- Solution: Verify SSH keys and remote system availability
+
+**Progress Stalls:**
+- Network timeouts or SSH connection drops
+- GPU driver issues or resource exhaustion
+- Solution: Check connection stability and remote system resources
 
 ### **Step 2: Run a Test Job**
 Process a video file and let it run (or hang). Debug mode will generate extensive logs including:
@@ -283,7 +360,7 @@ DEBUG_MODE="false"
 ## 📋 Version & Author
 
 - **Author:** [KPKev](https://github.com/KPKev) & [Gemini] & [OpenAI 4.1 - Robust Recovery]
-- **Version:** 4.4 (Comprehensive Debugging, July 2025)
+- **Version:** 4.4 (Comprehensive Debugging, May 2025)
 - **License:** MIT / Open
 
 ---
